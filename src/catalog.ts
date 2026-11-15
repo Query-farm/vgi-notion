@@ -1,57 +1,103 @@
 /**
- * Assemble the functions into the catalog DuckDB attaches.
- *
- * To add a function: write it (see `greet.ts` / `sequence.ts` /
- * `fetch_items.ts`), then add it to `FUNCTIONS` below.
+ * Assemble the `notion` catalog: schema `main` and the `notion` secret type.
  */
 
-import type { CatalogDescriptor, VgiFunction } from "@query-farm/vgi";
-import { API_SECRET_TYPE, fetchItems } from "./fetch_items.ts";
-import { greet, greetWithStyle } from "./greet.ts";
-import { CATALOG_DOC_MD, CATALOG_NAME, CATALOG_TAGS, SCHEMA_DOC_MD, SCHEMA_TAGS, SOURCE_URL } from "./meta.ts";
-import { sequenceTable } from "./sequence.ts";
+import { type CatalogDescriptor, field, schema, utf8, type VgiFunction } from "@query-farm/vgi";
+import { CATALOG_COMMENT, CATALOG_NAME, CATALOG_TAGS, SCHEMA_DOC_MD, SCHEMA_TAGS, SOURCE_URL } from "./meta.ts";
+import { blocks, pageMarkdown, pageText } from "./notion/blocks.ts";
+import { DEFAULT_BASE_URL, DEFAULT_RPS, NOTION_VERSION, SECRET_TYPE } from "./notion/client.ts";
+import { queryDatabase, queryDataSource } from "./notion/query.ts";
+import { comments, dataSourceSchema, NOTION_TABLES, page, pageProperties, search } from "./notion/resources.ts";
 
-export const FUNCTIONS: VgiFunction[] = [greet, greetWithStyle, sequenceTable, fetchItems];
+export const FUNCTIONS: VgiFunction[] = [
+  search,
+  dataSourceSchema,
+  queryDataSource,
+  queryDatabase,
+  page,
+  pageProperties,
+  blocks,
+  pageMarkdown,
+  pageText,
+  comments,
+];
+
+const doc = (text: string) => new Map([["vgi_doc", text]]);
+const redacted = (text: string) =>
+  new Map([
+    ["redact", "true"],
+    ["vgi_doc", text],
+  ]);
+
+/** CREATE SECRET (TYPE notion, TOKEN 'ntn_…') — or OAUTH_ACCESS_TOKEN for a public integration. */
+export const NOTION_SECRET_TYPE = {
+  name: SECRET_TYPE,
+  description: "Notion integration token (internal integration secret or OAuth access token)",
+  schema: schema(
+    [
+      field(
+        "token",
+        utf8(),
+        true,
+        redacted(
+          "Internal integration secret (ntn_… or secret_…) from notion.so/profile/integrations, sent as Bearer.",
+        ),
+      ),
+      field(
+        "oauth_access_token",
+        utf8(),
+        true,
+        redacted("A public integration's OAuth 2.0 access token (sent as Bearer)."),
+      ),
+      field(
+        "base_url",
+        utf8(),
+        true,
+        doc(`API base URL (default ${DEFAULT_BASE_URL}); http:// only for 127.0.0.1/localhost, e.g. a fixture server.`),
+      ),
+      field("notion_version", utf8(), true, doc(`Notion-Version header to send (default ${NOTION_VERSION}).`)),
+      field(
+        "requests_per_second",
+        utf8(),
+        true,
+        doc(`Client-side average request rate (default ${DEFAULT_RPS}, Notion's documented limit).`),
+      ),
+    ],
+    new Map([["vgi_doc_url", "https://developers.notion.com/docs/authorization"]]),
+  ),
+};
 
 interface Example {
   description: string;
   sql: string;
 }
 
-/**
- * Publish each function's examples as `vgi.example_queries` (with descriptions).
- *
- * Overloads share one SQL name, so their examples are merged per name.
- * Returns every example, for the schema-level list.
- */
+/** Publish each function's examples as `vgi.example_queries`; return them all for the schema. */
 function stampExampleQueries(functions: VgiFunction[]): Example[] {
-  const byName = new Map<string, Example[]>();
+  const all: Example[] = [];
   for (const fn of functions) {
-    const bucket = byName.get(fn.meta.name) ?? [];
-    byName.set(fn.meta.name, bucket);
-    for (const ex of fn.meta.examples ?? []) {
-      if (!bucket.some((e) => e.sql === ex.sql)) bucket.push({ description: ex.description, sql: ex.sql });
-    }
+    const ex = (fn.meta.examples ?? []).map((e) => ({ description: e.description, sql: e.sql }));
+    fn.meta.tags = { ...fn.meta.tags, "vgi.example_queries": JSON.stringify(ex) };
+    all.push(...ex);
   }
-  for (const fn of functions) {
-    fn.meta.tags = { ...fn.meta.tags, "vgi.example_queries": JSON.stringify(byName.get(fn.meta.name)) };
-  }
-  return [...byName.values()].flat();
+  return all;
 }
 
-const ALL_EXAMPLES = stampExampleQueries(FUNCTIONS);
+const tableExamples = NOTION_TABLES.flatMap((t) => JSON.parse(t.tags?.["vgi.example_queries"] ?? "[]") as Example[]);
+const ALL_EXAMPLES = [...stampExampleQueries(FUNCTIONS), ...tableExamples];
 
 export const CATALOG: CatalogDescriptor = {
   name: CATALOG_NAME,
-  comment: CATALOG_DOC_MD,
+  comment: CATALOG_COMMENT,
   sourceUrl: SOURCE_URL,
   tags: CATALOG_TAGS,
-  secretTypes: [API_SECRET_TYPE],
+  secretTypes: [NOTION_SECRET_TYPE],
   schemas: [
     {
       path: ["main"],
       comment: SCHEMA_DOC_MD,
       functions: FUNCTIONS,
+      tables: NOTION_TABLES,
       tags: { ...SCHEMA_TAGS, "vgi.example_queries": JSON.stringify(ALL_EXAMPLES) },
     },
   ],
