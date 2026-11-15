@@ -16,7 +16,8 @@
  *   page property item endpoint.
  */
 
-import { bool, defineTableFunction, field, schema, utf8, type VgiFunction, type VgiSchema } from "@query-farm/vgi";
+import { bool, defineTableFunction, field, formatPushedFilters, schema, utf8, type VgiFunction, type VgiSchema } from "@query-farm/vgi";
+import { log } from "../log.ts";
 import { column } from "../meta.ts";
 import {
   asList,
@@ -226,6 +227,7 @@ function makeQueryFunction(opts: {
       const user = parseJsonArg(params.args.notion_filter, "notion_filter", "object") as Json | undefined;
       const sorts = parseJsonArg(params.args.notion_sorts, "notion_sorts", "array") as Json[] | undefined;
       const filter = combineFilters(user, pushed);
+      log.debug(`${opts.name}: pushed ${formatPushedFilters(params.pushdownFilters)} → ${JSON.stringify(filter ?? null)}`);
 
       const byName = new Map(props.map((p) => [p.name, p]));
       const getters = new Map<string, (r: Json) => unknown>([
@@ -304,7 +306,7 @@ const QUERY_DOC_LLM =
   'STRUCT(start, end TIMESTAMPTZ, time_zone, has_time) — filter with "Due".start, created/last_edited ' +
   "time TIMESTAMPTZ, files LIST(STRUCT(name,type,url,expiry_time)), unique_id BIGINT, formula/rollup by " +
   "result type. Call data_source_schema(id) first to see the exact column names and types. WHERE on " +
-  "properties pushes down into Notion's filter (equality, ranges, IN, LIKE prefix/contains, list_contains, " +
+  "properties pushes down into Notion's filter (equality, ranges, IN, LIKE '%…%' / contains / suffix, list_contains, " +
   "IS NULL, AND/OR); only the columns you select are downloaded. Ids may be given as notion.so URLs.";
 
 const QUERY_DOC_MD =

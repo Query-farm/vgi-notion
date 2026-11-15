@@ -1,148 +1,762 @@
 # name: test/sql/notion.test
-# description: SQL-level tests for the notion worker, run through DuckDB by ci/run-integration.sh
+# description: SQL tests for the notion worker against the offline Notion replay server (test/mock_api/server.py)
 # group: [notion]
-# managed-by: vgi-starters (edit upstream in shared/, then run tools/render.py)
 
 require vgi
 
 require-env NOTION_WORKER
 
-require-env NOTION_MOCK_API
+require-env NOTION_FIXTURE_URL
 
-require-env NOTION_MOCK_API_AUTH
+# httpfs + json read the replay server's /__requests log to assert what was pushed down.
+statement ok
+LOAD httpfs;
 
+statement ok
+LOAD json;
+
+# No ICU in the test runner: TIMESTAMPTZ values print in UTC.
 statement ok
 ATTACH 'notion' (TYPE vgi, LOCATION '{NOTION_WORKER}');
 
-# ---------------------------------------------------------------- greet (scalar)
+# ------------------------------------------------------------- secrets and errors
 
-query T
-SELECT notion.main.greet('Ada');
+statement error
+SELECT count(*) FROM notion.main.users;
 ----
-Hi, Ada!
+<REGEX>:.*no notion secret.*
 
-query T
-SELECT notion.main.greet('Ada', 'formal');
+statement ok
+CREATE SECRET bad_token (TYPE notion, TOKEN 'ntn_wrong', BASE_URL '{NOTION_FIXTURE_URL}', REQUESTS_PER_SECOND '50');
+
+statement error
+SELECT count(*) FROM notion.main.search();
 ----
-Good day, Ada.
+<REGEX>:.*HTTP 401 unauthorized.*
 
-# NULL in, NULL out.
+statement ok
+DROP SECRET bad_token;
+
+statement ok
+CREATE SECRET insecure (TYPE notion, TOKEN 'ntn_test_token', BASE_URL 'http://api.notion.com');
+
+statement error
+SELECT count(*) FROM notion.main.users;
+----
+<REGEX>:.*must use https.*
+
+statement ok
+DROP SECRET insecure;
+
+statement ok
+CREATE SECRET no_token (TYPE notion, BASE_URL '{NOTION_FIXTURE_URL}');
+
+statement error
+SELECT count(*) FROM notion.main.users;
+----
+<REGEX>:.*set TOKEN.*
+
+statement ok
+DROP SECRET no_token;
+
+# The Notion-Version header is pinned; another version is the server's validation error.
+statement ok
+CREATE SECRET old_version (TYPE notion, TOKEN 'ntn_test_token', BASE_URL '{NOTION_FIXTURE_URL}', NOTION_VERSION '2022-06-28');
+
+statement error
+SELECT count(*) FROM notion.main.data_source_schema('1a2b3c4d-0000-4000-8000-00000000d501');
+----
+<REGEX>:.*HTTP 400 validation_error.*2022-06-28.*
+
+statement ok
+DROP SECRET old_version;
+
+# An OAuth access token works the same way (sent as Bearer).
+statement ok
+CREATE SECRET oauth (TYPE notion, OAUTH_ACCESS_TOKEN 'ntn_test_token', BASE_URL '{NOTION_FIXTURE_URL}', REQUESTS_PER_SECOND '50');
+
+query I
+SELECT count(*) FROM notion.main.users WHERE id = '1a2b3c4d-0000-4000-8000-00000000e001';
+----
+1
+
+statement ok
+DROP SECRET oauth;
+
+statement ok
+CREATE SECRET notion (TYPE notion, TOKEN 'ntn_test_token', BASE_URL '{NOTION_FIXTURE_URL}', REQUESTS_PER_SECOND '50');
+
+# The token is redacted in duckdb_secrets().
+query I
+SELECT secret_string LIKE '%ntn_test_token%' FROM duckdb_secrets() WHERE name = 'notion';
+----
+false
+
+# Every request carried the bearer token and the pinned Notion-Version.
+query II
+SELECT DISTINCT auth, version FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/users/1a2b3c4d-0000-4000-8000-00000000e001');
+----
+ok	2026-03-11
+
+# ======================================================================== discovery
+
+statement ok
+SELECT * FROM read_json('{NOTION_FIXTURE_URL}/__reset');
+
+# search: everything shared, paged 3 at a time; the first call is rate-limited once (429 Retry-After: 1).
+query TTTT
+SELECT object, title, parent_type, database_id FROM notion.main.search() ORDER BY object, title;
+----
+data_source	Bugs	database_id	1a2b3c4d-0000-4000-8000-00000000d003
+data_source	Projects	database_id	1a2b3c4d-0000-4000-8000-00000000d002
+data_source	Requests	database_id	1a2b3c4d-0000-4000-8000-00000000d003
+data_source	Tasks	database_id	1a2b3c4d-0000-4000-8000-00000000d001
+page	Crash on empty query	data_source_id	1a2b3c4d-0000-4000-8000-00000000d001
+page	Docs	data_source_id	1a2b3c4d-0000-4000-8000-00000000d002
+page	Engineering Wiki	page_id	NULL
+page	Index documents	data_source_id	1a2b3c4d-0000-4000-8000-00000000d001
+page	Meeting Notes	workspace	NULL
+page	Product Roadmap	workspace	NULL
+page	Release 1.0	data_source_id	1a2b3c4d-0000-4000-8000-00000000d001
+page	Search	data_source_id	1a2b3c4d-0000-4000-8000-00000000d002
+page	Search UI	data_source_id	1a2b3c4d-0000-4000-8000-00000000d001
+page	Search revamp	data_source_id	1a2b3c4d-0000-4000-8000-00000000d001
+page	Write docs	data_source_id	1a2b3c4d-0000-4000-8000-00000000d001
+
+# 15 results / 3 per page = 5 pages, plus the one 429 that was retried after its Retry-After.
+query III
+SELECT count(*), count(*) FILTER (WHERE body::JSON->>'start_cursor' IS NOT NULL), (max(t) FILTER (WHERE seq = 2) - min(t)) >= 0.9
+FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/search');
+----
+6	4	true
+
+# WHERE object = 'page' and the query argument push into the search body.
 query T
-SELECT notion.main.greet(NULL);
+SELECT title FROM notion.main.search(query := 'search') WHERE object = 'page' ORDER BY title;
+----
+Search
+Search UI
+Search revamp
+
+query TT
+SELECT body::JSON->>'query', body::JSON->'filter'->>'value' FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/search') ORDER BY seq DESC LIMIT 1;
+----
+search	page
+
+query TII
+SELECT title, property_count, len(property_names) FROM notion.main.data_sources ORDER BY title;
+----
+Bugs	1	1
+Projects	2	2
+Requests	1	1
+Tasks	21	21
+
+# WHERE id = … reads the data source directly; WHERE database_id = … lists the database's sources.
+query T
+SELECT title FROM notion.main.data_sources WHERE id = '1a2b3c4d-0000-4000-8000-00000000d502';
+----
+Projects
+
+query T
+SELECT title FROM notion.main.data_sources WHERE database_id = '1a2b3c4d-0000-4000-8000-00000000d003' ORDER BY title;
+----
+Bugs
+Requests
+
+query TTT
+SELECT title, data_source_ids, is_inline FROM notion.main.databases ORDER BY title;
+----
+Feedback	[1a2b3c4d-0000-4000-8000-00000000d503, 1a2b3c4d-0000-4000-8000-00000000d504]	false
+Projects	[1a2b3c4d-0000-4000-8000-00000000d502]	false
+Tasks	[1a2b3c4d-0000-4000-8000-00000000d501]	true
+
+query TT
+SELECT title, data_sources[1].name FROM notion.main.databases WHERE id = '1a2b3c4d-0000-4000-8000-00000000d001';
+----
+Tasks	Tasks
+
+# users: paged 2 at a time; the first call is rate-limited once. Emails only when Notion returns them.
+query TTT
+SELECT name, type, email FROM notion.main.users ORDER BY name;
+----
+Ada Lovelace	person	ada@example.com
+Grace Hopper	person	grace@example.com
+Linus Torvalds	person	NULL
+VGI Notion	bot	NULL
+
+query II
+SELECT count(*), (max(t) FILTER (WHERE seq = (SELECT min(seq) + 1 FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/users'))) - min(t)) >= 0.9
+FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/users');
+----
+3	true
+
+# =================================================================== schema mapping
+
+query TTTTT
+SELECT property, type, column_name, sql_type, json_column FROM notion.main.data_source_schema('1a2b3c4d-0000-4000-8000-00000000d501') ORDER BY position;
+----
+Name	title	Name	VARCHAR	Name__json
+Status	status	Status	VARCHAR	NULL
+Priority	select	Priority	VARCHAR	NULL
+Tags	multi_select	Tags	VARCHAR[]	NULL
+Assignee	people	Assignee	VARCHAR[]	NULL
+Due	date	Due	STRUCT("start" TIMESTAMP WITH TIME ZONE, "end" TIMESTAMP WITH TIME ZONE, time_zone VARCHAR, has_time BOOLEAN)	NULL
+Estimate	number	Estimate	DOUBLE	NULL
+Blocked	checkbox	Blocked	BOOLEAN	NULL
+Project	relation	Project	VARCHAR[]	NULL
+Notes	rich_text	Notes	VARCHAR	Notes__json
+URL	url	URL_2	VARCHAR	NULL
+Owner email	email	Owner email	VARCHAR	NULL
+Attachments	files	Attachments	STRUCT("name" VARCHAR, "type" VARCHAR, url VARCHAR, expiry_time TIMESTAMP WITH TIME ZONE)[]	NULL
+Task ID	unique_id	Task ID	BIGINT	NULL
+Created	created_time	Created	TIMESTAMP WITH TIME ZONE	NULL
+Edited by	last_edited_by	Edited by	VARCHAR	NULL
+Score	formula	Score	DOUBLE	NULL
+Label	formula	Label	VARCHAR	NULL
+Project count	rollup	Project count	DOUBLE	NULL
+Project names	rollup	Project names	VARCHAR[]	NULL
+Run	button	NULL	NULL	NULL
+
+query TTT
+SELECT property, unnest(options).name AS option, unnest(options)."group" FROM notion.main.data_source_schema('1a2b3c4d-0000-4000-8000-00000000d501') WHERE type = 'status' ORDER BY option;
+----
+Status	Done	Complete
+Status	In progress	In progress
+Status	Not started	To-do
+
+query TTTT
+SELECT relation_data_source_id, formula_expression, rollup_function, unique_id_prefix FROM notion.main.data_source_schema('1a2b3c4d-0000-4000-8000-00000000d501') WHERE property IN ('Project', 'Score', 'Project count', 'Task ID') ORDER BY position;
+----
+1a2b3c4d-0000-4000-8000-00000000d502	NULL	NULL	NULL
+NULL	NULL	NULL	TASK
+NULL	prop("Estimate") * 2	NULL	NULL
+NULL	NULL	count	NULL
+
+# A database id resolves to its only data source; rich_text_json := false drops the __json siblings.
+query I
+SELECT count(*) FROM notion.main.data_source_schema('https://www.notion.so/acme/Tasks-1a2b3c4d00004000800000000000d001?v=0f0f', rich_text_json := false) WHERE json_column IS NOT NULL;
+----
+0
+
+# The bound columns match the schema (DESCRIBE binds query_data_source).
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501')) WHERE column_name IN ('id', 'Name__json', 'Due', 'URL_2', 'url', 'Score', 'Label', 'in_trash') ORDER BY column_name;
+----
+Due	STRUCT("start" TIMESTAMP WITH TIME ZONE, "end" TIMESTAMP WITH TIME ZONE, time_zone VARCHAR, has_time BOOLEAN)
+Label	VARCHAR
+Name__json	JSON
+Score	DOUBLE
+URL_2	VARCHAR
+id	VARCHAR
+in_trash	BOOLEAN
+url	VARCHAR
+
+# ======================================================================= row values
+
+query TTTTTRTI
+SELECT "Name", "Status", "Priority", "Tags", "Assignee", "Estimate", "Blocked", "Task ID" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') ORDER BY "Task ID";
+----
+Search revamp	In progress	High	[search, backend]	[1a2b3c4d-0000-4000-8000-00000000e001]	5.0	false	1
+Index documents	Done	Medium	[search, backend]	[1a2b3c4d-0000-4000-8000-00000000e001, 1a2b3c4d-0000-4000-8000-00000000e002]	3.0	false	2
+Crash on empty query	Not started	High	[backend]	[1a2b3c4d-0000-4000-8000-00000000e002]	2.0	true	3
+Search UI	In progress	Low	[frontend, search]	[]	8.0	false	4
+Write docs	Not started	NULL	[docs]	[1a2b3c4d-0000-4000-8000-00000000e003]	NULL	false	5
+Release 1.0	Done	High	[]	[1a2b3c4d-0000-4000-8000-00000000e001]	1.0	false	6
+
+# Six rows, two per page: three query pages. The cursor travels in scan state.
+query I
+SELECT count(*) FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/data_sources/1a2b3c4d-0000-4000-8000-00000000d501/query') WHERE body::JSON->>'page_size' = '100';
+----
+3
+
+# Projection pushdown: only the selected properties are requested (filter_properties).
+query T
+SELECT query FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/data_sources/1a2b3c4d-0000-4000-8000-00000000d501/query') ORDER BY seq DESC LIMIT 1;
+----
+{"filter_properties": ["title", "st:a", "pri1", "tag1", "ppl1", "est1", "chk1", "uid1"]}
+
+# Dates: all-day dates are 00:00 UTC with has_time false; ranges carry end and time zone.
+query TTTTT
+SELECT "Name", "Due".start = TIMESTAMPTZ '2026-10-15 10:00:00+00', "Due"."end" = TIMESTAMPTZ '2026-10-20 18:00:00+00', "Due".time_zone, "Due".has_time
+FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Task ID" = 2;
+----
+Index documents	true	true	Europe/London	true
+
+query TTT
+SELECT "Name", "Due".start = TIMESTAMPTZ '2026-11-20 00:00:00+00', "Due".has_time FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Task ID" = 1;
+----
+Search revamp	true	false
+
+# Rich text: plain text plus the raw JSON sibling; url / email; files; formula and rollup by result type.
+query TTTTT
+SELECT "Notes", "Notes__json"->1->>'plain_text', "URL_2", "Owner email", "Attachments"[1].name FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Task ID" = 1;
+----
+Ship search by Q4	search	https://example.com/spec/1	ada@example.com	spec.pdf
+
+query TRTRT
+SELECT "Name", "Score", "Label", "Project count", "Project names" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') ORDER BY "Task ID";
+----
+Search revamp	10.0	Search revamp (In progress)	1.0	[Search]
+Index documents	6.0	Index documents (Done)	1.0	[Search]
+Crash on empty query	4.0	Crash on empty query (Not started)	0.0	[]
+Search UI	16.0	Search UI (In progress)	2.0	[Search, Docs]
+Write docs	NULL	Write docs (Not started)	1.0	[Docs]
+Release 1.0	2.0	Release 1.0 (Done)	2.0	[Search, Docs]
+
+# A relation truncated in the page object (has_more) is completed from the property item endpoint (paged 1 at a time).
+query TT
+SELECT "Name", "Project" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Task ID" = 4;
+----
+Search UI	[1a2b3c4d-0000-4000-8000-00000000c101, 1a2b3c4d-0000-4000-8000-00000000c102]
+
+query I
+SELECT count(*) >= 2 FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/pages/1a2b3c4d-0000-4000-8000-00000000c004/properties/rel1');
+----
+true
+
+query TTTT
+SELECT "Created" = TIMESTAMPTZ '2026-10-01 09:00:00+00', created_time = TIMESTAMPTZ '2026-10-01 09:00:00+00', "Edited by", in_trash
+FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Task ID" = 1;
+----
+true	true	1a2b3c4d-0000-4000-8000-00000000e001	false
+
+# ======================================================================= pushdown
+
+# The last query request's filter object, for the checks below.
+statement ok
+CREATE MACRO last_filter() AS TABLE
+SELECT body::JSON->'filter' AS f FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/data_sources/1a2b3c4d-0000-4000-8000-00000000d501/query')
+WHERE body::JSON->>'page_size' = '100' ORDER BY seq DESC LIMIT 1;
+
+# status equality + a number range → an `and` of two property conditions (by property id).
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Status" = 'In progress' AND "Estimate" >= 5 ORDER BY 1;
+----
+Search UI
+Search revamp
+
+query T
+SELECT f FROM last_filter();
+----
+{"and":[{"property":"st%3Aa","status":{"equals":"In progress"}},{"property":"est1","number":{"greater_than_or_equal_to":5}}]}
+
+# IN → or; list_contains on multi_select; LIKE '%…%' → contains (a prefix LIKE reaches the worker as a range and stays in the SDK); created_time → a widened timestamp filter.
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501')
+WHERE "Status" IN ('Done', 'Not started') AND list_contains("Tags", 'backend') AND "Name" LIKE '%empty%' AND created_time >= TIMESTAMPTZ '2026-10-03 00:00:00+00';
+----
+Crash on empty query
+
+query T
+SELECT f FROM last_filter();
+----
+{"and":[{"or":[{"property":"st%3Aa","status":{"equals":"Done"}},{"property":"st%3Aa","status":{"equals":"Not started"}}]},{"property":"tag1","multi_select":{"contains":"backend"}},{"property":"title","title":{"contains":"empty"}},{"timestamp":"created_time","created_time":{"on_or_after":"2026-10-01T22:00:00.000Z"}}]}
+
+# The widened created_time bound let Index documents (Oct 2) through the server; the SDK re-applies the exact predicate.
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE created_time > TIMESTAMPTZ '2026-10-04 09:00:00+00' ORDER BY 1;
+----
+Release 1.0
+Write docs
+
+# people contains, NOT checkbox, unique_id, select IS NULL → is_empty, rich text IS NOT NULL → is_not_empty.
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE list_contains("Assignee", '1a2b3c4d-0000-4000-8000-00000000e002') AND NOT "Blocked";
+----
+Index documents
+
+query T
+SELECT f FROM last_filter();
+----
+{"and":[{"property":"ppl1","people":{"contains":"1a2b3c4d-0000-4000-8000-00000000e002"}},{"property":"chk1","checkbox":{"equals":false}}]}
+
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Priority" IS NULL AND "Task ID" > 1;
+----
+Write docs
+
+query T
+SELECT f FROM last_filter();
+----
+{"and":[{"property":"pri1","select":{"is_empty":true}},{"property":"uid1","unique_id":{"greater_than":1}}]}
+
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Notes" IS NOT NULL ORDER BY 1;
+----
+Crash on empty query
+Search revamp
+
+query T
+SELECT f FROM last_filter();
+----
+{"property":"txt1","rich_text":{"is_not_empty":true}}
+
+# A date's start: only the (widened) lower bound is sent; the upper bound is re-checked by the SDK.
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501')
+WHERE "Due".start >= TIMESTAMPTZ '2026-11-04 00:00:00+00' AND "Due".start < TIMESTAMPTZ '2026-12-01 00:00:00+00' ORDER BY 1;
+----
+Search revamp
+Write docs
+
+query T
+SELECT f FROM last_filter();
+----
+{"property":"due1","date":{"on_or_after":"2026-11-02T22:00:00.000Z"}}
+
+# Formula number / string conditions; a relation contains.
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Score" > 5 AND list_contains("Project", '1a2b3c4d-0000-4000-8000-00000000c102');
+----
+Search UI
+
+query T
+SELECT f FROM last_filter();
+----
+{"and":[{"property":"fml1","formula":{"number":{"greater_than":5}}},{"property":"rel1","relation":{"contains":"1a2b3c4d-0000-4000-8000-00000000c102"}}]}
+
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Label" = 'Write docs (Not started)';
+----
+Write docs
+
+query T
+SELECT f FROM last_filter();
+----
+{"property":"fml2","formula":{"string":{"equals":"Write docs (Not started)"}}}
+
+# Untranslatable predicates are not sent (and the SDK applies them): text <> and a function call.
+query T
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') WHERE "Status" <> 'Done' AND lower("Name") = 'search ui';
+----
+Search UI
+
+query T
+SELECT f FROM last_filter();
 ----
 NULL
 
-# Works over a whole column, one result per row.
+# notion_filter (raw Notion JSON) is ANDed with the pushed WHERE; notion_sorts orders the rows.
 query T
-SELECT notion.main.greet(name) FROM (VALUES ('Ada'), ('Grace'), (NULL)) AS t(name) ORDER BY ALL NULLS LAST;
+SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501',
+  notion_filter := '{"property":"Tags","multi_select":{"contains":"search"}}',
+  notion_sorts := '[{"property":"Estimate","direction":"descending"}]') WHERE "Status" = 'In progress';
 ----
-Hi, Ada!
-Hi, Grace!
-NULL
+Search UI
+Search revamp
 
-# `style` is constrained to 'casual' | 'formal' and checked when the query is bound.
-# (No expected message: each SDK words constraint errors its own way.)
+query TT
+SELECT body::JSON->'filter', body::JSON->'sorts' FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/data_sources/1a2b3c4d-0000-4000-8000-00000000d501/query') WHERE body::JSON->>'page_size' = '100' ORDER BY seq DESC LIMIT 1;
+----
+{"and":[{"property":"Tags","multi_select":{"contains":"search"}},{"property":"st%3Aa","status":{"equals":"In progress"}}]}	[{"property":"Estimate","direction":"descending"}]
+
 statement error
-SELECT notion.main.greet('Ada', 'loud');
+SELECT count(*) FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501', notion_filter := '{not json');
 ----
-<REGEX>:.*
+<REGEX>:.*notion_filter is not valid JSON.*
 
-# ------------------------------------------------------ sequence_table (table fn)
-
-query II
-SELECT n, squared FROM notion.main.sequence_table(4) ORDER BY n;
+# A bad raw filter is Notion's own 400.
+statement error
+SELECT count(*) FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501', notion_filter := '{"property":"Nope","select":{"equals":"x"}}');
 ----
-0	0
-1	1
-2	4
-3	9
+<REGEX>:.*HTTP 400 validation_error.*Nope.*
 
-# Named argument with a default.
+# count(*) asks for one property only, not all of them.
 query I
-SELECT n FROM notion.main.sequence_table(3, step := 5) ORDER BY n;
+SELECT count(*) FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501');
 ----
-0
-5
-10
+6
 
-# Larger than one batch: the cursor must carry across process calls.
-query II
-SELECT count(*), max(n) FROM notion.main.sequence_table(25000);
+query T
+SELECT query FROM read_json('{NOTION_FIXTURE_URL}/__requests?path=/v1/data_sources/1a2b3c4d-0000-4000-8000-00000000d501/query') ORDER BY seq DESC LIMIT 1;
 ----
-25000	24999
+{"filter_properties": ["title"]}
+
+# query_database takes the database id or URL; a database with two data sources is an error naming them.
+query I
+SELECT count(*) FROM notion.main.query_database('https://www.notion.so/acme/Tasks-1a2b3c4d00004000800000000000d001?v=abc') WHERE "Status" = 'Done';
+----
+2
+
+statement error
+SELECT count(*) FROM notion.main.query_database('1a2b3c4d-0000-4000-8000-00000000d003');
+----
+<REGEX>:.*has 2 data sources: Bugs.*Requests.*
+
+statement error
+SELECT count(*) FROM notion.main.query_data_source('not-an-id');
+----
+<REGEX>:.*does not contain a Notion id.*
+
+statement error
+SELECT count(*) FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-0000000000ff');
+----
+<REGEX>:.*HTTP 404 object_not_found.*
+
+# Joining a relation to another data source and people to users.
+query TT
+SELECT t."Name", p."Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') t
+JOIN notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d502') p ON list_contains(t."Project", p.id)
+WHERE t."Status" = 'Done' ORDER BY 1, 2;
+----
+Index documents	Search
+Release 1.0	Docs
+Release 1.0	Search
+
+query T
+SELECT t."Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') t, notion.main.users u
+WHERE list_contains(t."Assignee", u.id) AND u.name = 'Ada Lovelace' ORDER BY 1;
+----
+Index documents
+Release 1.0
+Search revamp
+
+# ======================================================================== content
+
+query TTTT
+SELECT title, parent_type, data_source_id, database_id FROM notion.main.page('1a2b3c4d-0000-4000-8000-00000000c001');
+----
+Search revamp	data_source_id	1a2b3c4d-0000-4000-8000-00000000d501	1a2b3c4d-0000-4000-8000-00000000d001
+
+query TT
+SELECT title, icon FROM notion.main.page('https://www.notion.so/acme/Product-Roadmap-1a2b3c4d00004000800000000000a001');
+----
+Product Roadmap	🗺️
+
+query TTT
+SELECT property, type, text FROM notion.main.page_properties('1a2b3c4d-0000-4000-8000-00000000c004') WHERE text IS NOT NULL ORDER BY position;
+----
+Name	title	Search UI
+Status	status	In progress
+Priority	select	Low
+Tags	multi_select	frontend, search
+Due	date	2026-12-01
+Estimate	number	8
+Blocked	checkbox	false
+Project	relation	1a2b3c4d-0000-4000-8000-00000000c101, 1a2b3c4d-0000-4000-8000-00000000c102
+Attachments	files	mock.png
+Task ID	unique_id	TASK-4
+Created	created_time	2026-10-04T09:00:00.000Z
+Edited by	last_edited_by	Ada Lovelace
+Score	formula	16
+Label	formula	Search UI (In progress)
+Project count	rollup	2
+Project names	rollup	Search, Docs
+
+# blocks: depth-first, nested children, sub-pages and child databases not walked by default.
+query ITTTT
+SELECT depth, path, type, replace(text, chr(9), ' | '), checked FROM notion.main.blocks('1a2b3c4d-0000-4000-8000-00000000a001') ORDER BY path;
+----
+1	00000	heading_1	Goals	NULL
+1	00001	paragraph	Ship search by Q4.	NULL
+1	00002	bulleted_list_item	Faster indexing	NULL
+2	00002.00000	bulleted_list_item	Sharding	NULL
+2	00002.00001	bulleted_list_item	Caching	NULL
+1	00003	bulleted_list_item	Better ranking	NULL
+1	00004	numbered_list_item	Design	NULL
+1	00005	numbered_list_item	Build	NULL
+1	00006	numbered_list_item	Launch	NULL
+1	00007	to_do	Write spec	true
+1	00008	to_do	Review spec	false
+1	00009	to_do	Kickoff	true
+1	00010	heading_2	Timeline	NULL
+1	00011	table	NULL	NULL
+2	00011.00000	table_row	Phase | Date	NULL
+2	00011.00001	table_row	Beta | Nov 1	NULL
+2	00011.00002	table_row	GA | Dec 1	NULL
+1	00012	code	print('launch')	NULL
+1	00013	quote	Stay focused	NULL
+1	00014	callout	Remember the launch	NULL
+1	00015	toggle	Details	NULL
+2	00015.00000	paragraph	Hidden text	NULL
+1	00016	divider	NULL	NULL
+1	00017	image	Diagram	NULL
+1	00018	child_page	Engineering Wiki	NULL
+1	00019	child_database	Tasks	NULL
+1	00020	heading_3	Notes	NULL
+1	00021	paragraph	Owner: @Ada Lovelace	NULL
+
+query TTT
+SELECT language, url, rich_text->0->>'plain_text' FROM notion.main.blocks('1a2b3c4d-0000-4000-8000-00000000a001') WHERE type IN ('code', 'image') ORDER BY path;
+----
+python	NULL	print('launch')
+NULL	https://example.com/diagram.png	Diagram
+
+# max_depth := 1 is direct children only; include_child_pages walks into the Engineering Wiki.
+query I
+SELECT count(*) FROM notion.main.blocks('1a2b3c4d-0000-4000-8000-00000000a001', max_depth := 1);
+----
+22
+
+query TT
+SELECT parent_id, text FROM notion.main.blocks('1a2b3c4d-0000-4000-8000-00000000a001', include_child_pages := true) WHERE depth = 2 AND parent_id = '1a2b3c4d-0000-4000-8000-00000000a002' ORDER BY path;
+----
+1a2b3c4d-0000-4000-8000-00000000a002	Wiki home
+1a2b3c4d-0000-4000-8000-00000000a002	Onboarding
 
 query I
-SELECT count(*) FROM notion.main.sequence_table(0);
+SELECT count(*) FILTER (WHERE checked) FROM notion.main.blocks('1a2b3c4d-0000-4000-8000-00000000a001') WHERE type = 'to_do';
 ----
-0
+2
 
-# count is constrained to [0, 1000000].
+# page_markdown: one GFM document.
+query TIT
+SELECT title, block_count, truncated FROM notion.main.page_markdown('1a2b3c4d-0000-4000-8000-00000000a001');
+----
+Product Roadmap	28	false
+
+query T
+SELECT replace(unnest(string_split(markdown, chr(10))), chr(9), ' | ') FROM notion.main.page_markdown('1a2b3c4d-0000-4000-8000-00000000a001');
+----
+# Product Roadmap
+(empty)
+# Goals
+(empty)
+Ship **search** by [Q4](https://example.com/q4).
+(empty)
+- Faster indexing
+  - Sharding
+  - Caching
+- Better ranking
+(empty)
+1. Design
+2. Build
+3. Launch
+(empty)
+- [x] Write spec
+- [ ] Review spec
+- [x] Kickoff
+(empty)
+## Timeline
+(empty)
+| Phase | Date |
+| --- | --- |
+| Beta | Nov 1 |
+| GA | _Dec 1_ |
+(empty)
+```python
+print('launch')
+```
+(empty)
+> Stay focused
+(empty)
+> 💡 Remember the launch
+(empty)
+- Details
+  Hidden text
+(empty)
+---
+(empty)
+![Diagram](https://example.com/diagram.png)
+(empty)
+**Engineering Wiki**
+(empty)
+**Tasks**
+(empty)
+### Notes
+(empty)
+Owner: @Ada Lovelace
+(empty)
+
+query T
+SELECT replace(unnest(string_split(markdown, chr(10))), chr(9), ' | ') FROM notion.main.page_markdown('1a2b3c4d-0000-4000-8000-00000000a002', include_title := false);
+----
+Wiki home
+(empty)
+- Onboarding
+(empty)
+
+# include_child_pages inlines the sub-page; max_depth cuts nesting and says so.
+query T
+SELECT markdown LIKE '%Wiki home%' FROM notion.main.page_markdown('1a2b3c4d-0000-4000-8000-00000000a001', include_child_pages := true);
+----
+true
+
+query IT
+SELECT block_count, truncated FROM notion.main.page_text('1a2b3c4d-0000-4000-8000-00000000a001', max_depth := 1);
+----
+22	true
+
+query T
+SELECT replace(unnest(string_split(text, chr(10))), chr(9), ' | ') FROM notion.main.page_text('1a2b3c4d-0000-4000-8000-00000000a001') ;
+----
+Product Roadmap
+(empty)
+Goals
+(empty)
+Ship search by Q4.
+(empty)
+- Faster indexing
+  - Sharding
+  - Caching
+- Better ranking
+(empty)
+1. Design
+2. Build
+3. Launch
+(empty)
+- [x] Write spec
+- [ ] Review spec
+- [x] Kickoff
+(empty)
+Timeline
+(empty)
+Phase | Date
+Beta | Nov 1
+GA | Dec 1
+(empty)
+print('launch')
+(empty)
+Stay focused
+(empty)
+💡 Remember the launch
+(empty)
+- Details
+  Hidden text
+(empty)
+Diagram
+(empty)
+Engineering Wiki
+(empty)
+Tasks
+(empty)
+Notes
+(empty)
+Owner: @Ada Lovelace
+(empty)
+
 statement error
-SELECT * FROM notion.main.sequence_table(-1);
+SELECT * FROM notion.main.page_markdown('1a2b3c4d-0000-4000-8000-0000000000ff');
 ----
-<REGEX>:.*
+<REGEX>:.*not found or not shared.*
 
-# Named arguments are constrained too: step >= 1.
-statement error
-SELECT * FROM notion.main.sequence_table(3, step := 0);
+# comments: page-level discussion (the first call answers 503 once and is retried) and a block's inline comment.
+query TTTT
+SELECT display_name, text, discussion_id, len(attachments) FROM notion.main.comments('1a2b3c4d-0000-4000-8000-00000000a001') ORDER BY created_time;
 ----
-<REGEX>:.*
+Ada Lovelace	Can we move GA earlier?	1a2b3c4d-0000-4000-8000-00000000f0d1	0
+Grace Hopper	Only if indexing is done.	1a2b3c4d-0000-4000-8000-00000000f0d1	1
 
-# ------------------------------------------------- fetch_items (REST table fn)
-
-query IIT
-SELECT count(*), sum(id), min(name) FROM notion.main.fetch_items('{NOTION_MOCK_API}', page_size := 4);
+query TTT
+SELECT parent_type, display_name, text FROM notion.main.comments('1a2b3c4d-0000-4000-8000-00000000b002');
 ----
-25	325	item-01
+block_id	Linus Torvalds	Which quarter?
 
-query TI
-SELECT category, count(*) FROM notion.main.fetch_items('{NOTION_MOCK_API}') GROUP BY category ORDER BY category;
-----
-hardware	8
-service	8
-software	9
+# ================================================================== rate limiting
 
-# The harness runs NOTION_MOCK_API with MOCK_API_FLAKY=1: every page answers
-# 429 + Retry-After once, so every query above also exercised the retry path.
-
-# NOTION_MOCK_API_AUTH requires a bearer token ('test-token'). Every language's
-# fetch_items must put the HTTP status code in its error message.
-statement error
-SELECT count(*) FROM notion.main.fetch_items('{NOTION_MOCK_API_AUTH}');
-----
-401
+# A 2 request/second token bucket (burst 2): seven user lookups take at least 2.5 s.
+statement ok
+CREATE OR REPLACE SECRET notion (TYPE notion, TOKEN 'ntn_test_token', BASE_URL '{NOTION_FIXTURE_URL}', REQUESTS_PER_SECOND '2');
 
 statement ok
-CREATE SECRET notion_api_test (TYPE notion_api, TOKEN 'test-token');
+SELECT * FROM read_json('{NOTION_FIXTURE_URL}/__reset');
 
 query I
-SELECT count(*) FROM notion.main.fetch_items('{NOTION_MOCK_API_AUTH}', page_size := 25);
+SELECT count(*) FROM notion.main.users WHERE id IN ('1a2b3c4d-0000-4000-8000-00000000e001', '1a2b3c4d-0000-4000-8000-00000000e002', '1a2b3c4d-0000-4000-8000-00000000e003', '1a2b3c4d-0000-4000-8000-00000000e0b1', '1a2b3c4d-0000-4000-8000-0000000000a1', '1a2b3c4d-0000-4000-8000-0000000000a2', '1a2b3c4d-0000-4000-8000-0000000000a3');
 ----
-25
+4
 
-# Several pages: the token must survive between batches (over HTTP each batch is a
-# separate request, so a token kept only in memory is lost after page 1).
-query I
-SELECT count(*) FROM notion.main.fetch_items('{NOTION_MOCK_API_AUTH}', page_size := 7);
+query T
+SELECT max(t) - min(t) >= 2.4 FROM read_json('{NOTION_FIXTURE_URL}/__requests') WHERE path LIKE '/v1/users/%';
 ----
-25
-
-statement ok
-DROP SECRET notion_api_test;
-
-# base_url must be http(s).
-statement error
-SELECT * FROM notion.main.fetch_items('ftp://example.com');
-----
-<REGEX>:.*
-
-# page_size is a named argument constrained to [1, 1000].
-statement error
-SELECT * FROM notion.main.fetch_items('{NOTION_MOCK_API}', page_size := 0);
-----
-<REGEX>:.*
-
-statement error
-SELECT * FROM notion.main.fetch_items('{NOTION_MOCK_API}', page_size := 5000);
-----
-<REGEX>:.*
+true

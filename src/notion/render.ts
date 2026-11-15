@@ -167,8 +167,11 @@ function renderBlock(node: BlockNode, fmt: Format, index: number): string {
       return md ? `[${label}](${url})` : label;
     }
     case "child_page":
-    case "child_database":
-      return md ? `**${b.title ?? ""}**` : String(b.title ?? "");
+    case "child_database": {
+      // A sub-page's blocks are present only with include_child_pages: inline them under its title.
+      const head = md ? `**${b.title ?? ""}**` : String(b.title ?? "");
+      return node.children.length ? `${head}\n\n${kids()}` : head;
+    }
     case "link_to_page": {
       const id = b.page_id ?? b.database_id ?? b.data_source_id ?? "";
       return md ? `[${id}](https://www.notion.so/${String(id).replace(/-/g, "")})` : String(id);

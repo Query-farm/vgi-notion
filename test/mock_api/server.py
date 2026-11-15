@@ -25,7 +25,7 @@ Notion-Version 2026-03-11) and behaves like Notion where the worker depends on i
   ``rate_limited`` with ``Retry-After: 1``; the first ``/v1/comments`` answers 503.
 * **Introspection.** ``GET /__requests?path=<path>`` returns every recorded request to that
   path (``seq``, ``method``, ``path``, ``query`` and ``body`` as JSON strings, ``auth``,
-  ``version``) so SQL tests can assert exactly what was pushed down; ``/__reset`` clears it.
+  ``version``, ``t`` = monotonic seconds) so SQL tests can assert exactly what was pushed down; ``/__reset`` clears it.
 
 Usage::
 
@@ -42,6 +42,7 @@ import json
 import re
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -590,7 +591,7 @@ class Handler(BaseHTTPRequestHandler):
                 "seq": len(REQUESTS) + 1, "method": method, "path": u.path,
                 "query": json.dumps(query, sort_keys=True), "body": raw.decode() or "null",
                 "auth": "ok" if auth == TOKEN else ("missing" if auth is None else "bad"),
-                "version": version,
+                "version": version, "t": round(time.monotonic(), 3),
             })
         try:
             if not u.path.startswith("/v1/"):
