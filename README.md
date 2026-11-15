@@ -1,38 +1,169 @@
-<!-- managed-by: vgi-starters (edit upstream in shared/README.md.tmpl, then run tools/render.py) -->
 <p align="center">
   <img src="https://query.farm/media-kit/products/vgi/vgi-logo.png" alt="Vector Gateway Interface (VGI)" width="320">
 </p>
 
-<p align="center"><em>A Query.Farm VGI worker for DuckDB, written in TypeScript.</em></p>
+<p align="center"><em>A Query.Farm VGI worker for DuckDB.</em></p>
 
-# VGI Notion Worker — TypeScript
+# Query Notion Databases, Pages and Blocks in DuckDB
+
+> **vgi-notion** · a [Query.Farm](https://query.farm) VGI worker · written in TypeScript
 
 [![CI](https://github.com/Query-farm/vgi-notion/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-notion/actions/workflows/ci.yml)
 [![vgi worker: query.farm](https://query.farm/media-kit/shields/vgi-worker.svg)](https://query.farm)
 
-[VGI](https://query.farm/vgi) lets DuckDB call functions that live in a separate
-process: your code, in any language, exposed as ordinary SQL. This worker adds
-three example functions that you rename and replace with your own:
+A Notion workspace as SQL, read-only. Any Notion database becomes a typed table with
+one column per property (title, status, select, people, relation, date, formula,
+rollup, …), your `WHERE` clause becomes a Notion filter object, and only the
+properties you select are downloaded. Page bodies come back as block rows or as one
+Markdown / plain-text document, ready for export, search and RAG.
 
-| Function | Kind | Shows you how to |
-|---|---|---|
-| `greet(name)` / `greet(name, style)` | scalar | vectorize over a column, overload, constrain a constant |
-| `sequence_table(count, step := 1)` | table | stream rows in batches, take named arguments |
-| `fetch_items(base_url, page_size := 100)` | table | page through a REST API, retry, read a secret |
+```sql
+CREATE SECRET notion (TYPE notion, TOKEN 'ntn_…');   -- an internal integration secret
 
+-- Open tasks due from November on. One request:
+--   {"and":[{"property":"Status","status":{"equals":"In progress"}},
+--           {"property":"Due","date":{"on_or_after":"…"}}]}
+SELECT "Name", "Assignee", "Due".start AS due
+FROM notion.main.query_database('https://www.notion.so/acme/Tasks-1a2b3c4d00004000800000000000d001')
+WHERE "Status" = 'In progress' AND "Due".start >= TIMESTAMPTZ '2026-11-01 00:00:00+00'
+ORDER BY due;
 
-## Quick start
+-- Story points per assignee, joining the people column to the workspace users.
+SELECT u.name, sum(t."Estimate") AS points
+FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') t, notion.main.users u
+WHERE list_contains(t."Assignee", u.id)
+GROUP BY u.name ORDER BY points DESC;
 
-**Prerequisites:** [Bun](https://bun.sh) 1.3+ and [uv](https://docs.astral.sh/uv/) (it runs the SQL
-test runner and the metadata checker).
-
-```bash
-make build
+-- A page as Markdown, and its outline.
+SELECT markdown FROM notion.main.page_markdown('1a2b3c4d-0000-4000-8000-00000000a001');
+SELECT depth, text FROM notion.main.blocks('1a2b3c4d-0000-4000-8000-00000000a001')
+WHERE type LIKE 'heading_%' ORDER BY path;
 ```
 
-Then open DuckDB 2.0 or [Haybarn](https://query.farm/products/haybarn) and attach the
-worker. `LOCATION` is the command DuckDB runs to start it; use an absolute path,
-because a relative one resolves against DuckDB's working directory.
+Ids can be dashed UUIDs, 32 hex digits, or a `notion.so` URL pasted from the browser.
+
+## Functions and tables
+
+All in schema `notion.main`.
+
+| Object | What it returns |
+| --- | --- |
+| `search(query := '')` | Pages and data sources shared with the integration, by title |
+| `data_sources` (table) | Every data source: id, title, database, property names |
+| `databases` (table) | Databases (containers) with their data sources |
+| `users` (table) | People and bots; email only when Notion returns it |
+| `data_source_schema(id)` | Each property, its Notion type and the SQL column it becomes; select / status options |
+| `query_data_source(id, notion_filter := NULL, notion_sorts := NULL, rich_text_json := true)` | The rows (pages) of a data source, one typed column per property |
+| `query_database(database_id, …)` | Same, for a database with one data source (the id in its URL) |
+| `page(page_id)` | One page's metadata and raw property JSON |
+| `page_properties(page_id)` | One page's properties as name / text / JSON rows |
+| `blocks(block_id, max_depth := 10, include_child_pages := false)` | The block tree: type, plain text, rich text JSON, depth, `path` for document order |
+| `page_markdown(page_id, …)` / `page_text(page_id, …)` | The page rendered to one GFM Markdown / plain-text document |
+| `comments(block_id)` | Open comments on a page or block, by discussion |
+
+### The data-source model
+
+This worker speaks **Notion-Version 2026-03-11**. Since 2025 a Notion *database* is a
+container of one or more *data sources*, and rows are queried per data source. Most
+databases hold exactly one: `query_database(url)` resolves it for you (and
+`query_data_source` accepts a database id in that case too). A database with several
+data sources is an error that names them.
+
+### Property types → columns
+
+| Notion property | Column type |
+| --- | --- |
+| title, rich_text | `VARCHAR` plain text, plus a `"<name>__json"` `JSON` sibling with marks, links and mentions |
+| number | `DOUBLE` |
+| checkbox | `BOOLEAN` |
+| select, status | `VARCHAR` option name |
+| multi_select | `VARCHAR[]` option names |
+| people, relation | `VARCHAR[]` user ids / related page ids (relations over 25 entries are completed) |
+| date | `STRUCT("start" TIMESTAMPTZ, "end" TIMESTAMPTZ, time_zone VARCHAR, has_time BOOLEAN)`; all-day dates are 00:00 UTC with `has_time = false` |
+| created_time, last_edited_time | `TIMESTAMPTZ` |
+| created_by, last_edited_by | `VARCHAR` user id |
+| url, email, phone_number | `VARCHAR` |
+| files | `STRUCT(name, type, url, expiry_time)[]` (Notion-hosted URLs expire) |
+| unique_id | `BIGINT` (the prefix is in `data_source_schema`) |
+| formula | by result type, read from one sample row: `VARCHAR`, `DOUBLE`, `BOOLEAN` or the date struct |
+| rollup | by function: `DOUBLE` (count, sum, average, …), the date struct (earliest / latest / range) or `VARCHAR[]` (show original / unique) |
+| verification | `VARCHAR` state |
+| button | no column |
+| anything else | `JSON` |
+
+Every row also has `id`, `url`, `created_time`, `last_edited_time`, `created_by`,
+`last_edited_by` and `in_trash`. Property names are kept verbatim (quote them); one
+that collides case-insensitively with another column gets a `_2` suffix.
+`data_source_schema(id)` shows the exact column name and type of every property.
+
+### Pushdown
+
+- **WHERE → Notion filter object** for `query_data_source` / `query_database`:
+  `=`, `<>`, ranges and `IN` on numbers, unique ids and number formulas; `=` / `IN` on
+  select, status, title, rich text, url, email, phone and string formulas;
+  `LIKE '%x%'`, `contains()` and `suffix()` on text; `list_contains()` on multi_select,
+  people and relation; `IS [NOT] NULL` on text, number, select, status and dates;
+  checkboxes; `created_time` / `last_edited_time` (as timestamp filters) and a date's
+  `.start` lower bound. `AND` sends what translates; `OR` is sent only when every branch
+  translates; nesting is capped at Notion's two levels.
+- **Narrowing only.** The SDK re-applies every pushed SQL predicate exactly, so Notion's
+  looser matching (case-insensitive text, date-granular comparisons, widened by a day) can
+  never change a result. Anything not translated is filtered in DuckDB.
+- **Projection → `filter_properties`**: only the selected properties are downloaded
+  (`count(*)` asks for the title only).
+- `notion_filter := '<filter JSON>'` is ANDed with the pushed filter; `notion_sorts`
+  passes Notion sorts through.
+- `search`: `WHERE object = 'page' | 'data_source'`. `data_sources`, `databases`, `users`:
+  `WHERE id = … / IN (…)` reads those objects directly; `data_sources WHERE database_id = …`
+  lists one database's sources.
+
+Prefix `LIKE 'x%'` reaches the worker as a string range, which has no Notion
+equivalent, so it is applied in DuckDB.
+
+## Authentication
+
+```sql
+-- Internal integration (notion.so/profile/integrations): share pages / databases with it.
+CREATE SECRET notion (TYPE notion, TOKEN 'ntn_…');
+-- Public integration: an OAuth 2.0 access token.
+CREATE SECRET notion (TYPE notion, OAUTH_ACCESS_TOKEN '…');
+```
+
+| Field | Meaning |
+| --- | --- |
+| `token` | Internal integration secret, sent as `Authorization: Bearer` (redacted) |
+| `oauth_access_token` | Public integration access token (redacted) |
+| `base_url` | API base (default `https://api.notion.com`); `http://` only for 127.0.0.1 / localhost |
+| `notion_version` | `Notion-Version` header (default `2026-03-11`) |
+| `requests_per_second` | Client-side average rate (default 3, Notion's documented limit) |
+
+The integration sees only what is shared with it. Emails appear in `users` only with
+the "read user information including email addresses" capability; comments need
+"read comments". The token is read from the secret on each call and never stored in
+scan state or logs. Use of the Notion API is subject to Notion's terms; the token and
+the workspace data it can reach are your responsibility.
+
+## Paging and rate limits
+
+Notion's `next_cursor` lives in each scan's serializable state (the `blocks` walk keeps
+its stack of pending parents there too), so a long scan streams one page per Arrow
+batch and resumes on any worker process over HTTP. The request body is rebuilt from the
+arguments and pushed filters on every call. A per-token token bucket keeps calls at the
+configured average rate; `429 rate_limited` honours `Retry-After` and pauses everyone
+sharing the token; 409 / 5xx and network errors back off exponentially (6 attempts, 30 s
+timeout per request). A data source query that hits Notion's 10,000-row cap
+(`request_status: incomplete`) is an error asking you to narrow it, never a silently
+truncated result.
+
+## Install
+
+**Prerequisites:** [Bun](https://bun.sh) 1.3+ (for a source checkout).
+
+```bash
+git clone https://github.com/Query-farm/vgi-notion.git && cd vgi-notion
+git checkout v0.1.0            # a release tag
+bun install --frozen-lockfile
+```
 
 **DuckDB 2.0:**
 
@@ -42,6 +173,7 @@ CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb
 INSTALL vgi FROM query_farm;
 LOAD vgi FROM query_farm;
 ATTACH 'notion' (TYPE vgi, LOCATION '/abs/path/to/vgi-notion/bin/vgi-notion-worker');
+CREATE SECRET notion (TYPE notion, TOKEN 'ntn_…');   -- after ATTACH: the worker registers the type
 ```
 
 **Haybarn 2.0** (`uvx haybarn-cli`):
@@ -52,244 +184,33 @@ LOAD vgi;
 ATTACH 'notion' (TYPE vgi, LOCATION '/abs/path/to/vgi-notion/bin/vgi-notion-worker');
 ```
 
-Now call the functions:
-
-```sql
-SELECT notion.main.greet('Ada');                         -- Hi, Ada!
-SELECT notion.main.greet('Ada', 'formal');               -- Good day, Ada.
-SELECT * FROM notion.main.sequence_table(5, step := 2) ORDER BY n;
-```
-
-`fetch_items` pages through a REST API. Try it against the public demo API (25 fixed items):
-
-```sql
-SELECT category, count(*) AS items, round(avg(price), 2) AS avg_price
-FROM notion.main.fetch_items('https://vgi-starter-api.query-farm.services/v1')
-GROUP BY category ORDER BY category;
-```
-
-If an older cached extension misbehaves, refresh it with `FORCE INSTALL vgi FROM query_farm;`
-(DuckDB) or `FORCE INSTALL vgi FROM community;` (Haybarn).
-
-## Using it in a pipeline
-
-Worker functions compose with everything else in DuckDB:
-
-```sql
--- Materialize an API into a local table.
-CREATE TABLE items AS SELECT * FROM notion.main.fetch_items('https://vgi-starter-api.query-farm.services/v1');
-
--- Join it with local files.
-SELECT i.name, i.price, s.units
-FROM items i JOIN 'sales.parquet' s ON s.item_id = i.id;
-
--- Call a scalar per row of another table.
-SELECT customer, notion.main.greet(customer, 'formal') FROM read_csv('customers.csv');
-```
-
-## Project layout
-
-```
-src/
-  worker.ts        # entry point: serves the catalog over stdio, --unix or --http
-  catalog.ts       # assembles the catalog; add new functions to FUNCTIONS
-  meta.ts          # catalog/schema metadata + helpers (objectTags, column)
-  greet.ts         # scalar example (overloads, const param with choices)
-  sequence.ts      # table function example (named args, streaming state)
-  fetch_items.ts   # REST API table function (pagination, retries, secrets)
-  cli.ts           # flag parsing: stdio / --unix / --http (PORT:<n>, /health)
-  log.ts           # stderr logger
-bin/               # vgi-notion-worker (what DuckDB launches) and run-recipe
-tests/             # bun unit tests (worker subprocess + mock API)
-test/sql/          # sqllogictest files run through DuckDB
-test/mock_api/     # offline mock of the REST API used by tests
-examples/          # recipes: pushdown, caching, catalog tables, aggregates, COPY …
-ci/                # integration harness used by `make test-sql` and CI
-scripts/           # vgi_template.py (init / template-diff)
-vgi-agent-tests.yaml  # private graders for the agent test tasks
-```
-
-## Adding a function
-
-1. Create `src/<name>.ts`. Copy the closest example: `greet.ts` for a scalar,
-   `sequence.ts` for a generator, `fetch_items.ts` for an API.
-2. Declare arguments: `params` + `argDocs` (scalars), or the ordered `parameters`
-   list when a constant needs `choices`/`ge`/`le`. Table functions use `args`,
-   `argDocs` and `argConstraints`; an argument listed in `argDefaults` becomes a
-   named argument (`step := 2`), the others are positional.
-3. Give it `description`, `tags: objectTags(...)` (from `src/meta.ts`) and
-   `examples`.
-4. Add it to `FUNCTIONS` in `src/catalog.ts`.
-
-**Which kind of function?**
-
-| You want to… | Use |
-|---|---|
-| compute one value per input row | a **scalar** function |
-| return a set of rows from arguments (an API, a file, a generator) | a **table** function |
-| transform or aggregate the rows of a query | a **table in-out** function or an **aggregate** |
-| expose a fixed dataset by name (`SELECT * FROM notion.main.t`) | a **catalog table** |
-| write data out to a file or service | `COPY … TO` with a copy function |
-| accept `INSERT` / `UPDATE` / `DELETE` | a catalog table with insert/update/delete functions |
-
-The [examples/](examples/) folder has a recipe for most of these. Writable tables have no
-recipe:
-
-A writable table is a `TableDescriptor` that names a table in-out function per operation in
-`insertFunction`, `updateFunction` and `deleteFunction`, with the richest result each one
-produces in `writeResultModes`. `writeOptions`, `writeResultSchema`, `writeResultBatch` and
-`rowIdField` (all exported by `@query-farm/vgi`) read DuckDB's `write_options` argument and
-build the result. UPDATE and DELETE need the table's scan `function` to emit `rowIdField()` and
-support projection pushdown. Transactions: return `supports_transactions` from the catalog's
-attach and override `transactionBegin` / `transactionCommit` / `transactionRollback`.
-Since VGI protocol 3.3 a table's scan and write functions are table-only: hidden from
-`duckdb_functions()` and not callable from SQL. Set `exposeScan: true` on the table to keep the
-scan callable as an ordinary table function too (write functions never are).
-[`examples/simple-writable-worker.ts`](https://github.com/Query-farm/vgi-typescript/blob/main/examples/simple-writable-worker.ts)
-and `examples/writable-tx-worker.ts` in vgi-typescript are complete workers.
-
-## Secrets and configuration
-
-`fetch_items` shows the recommended pattern. A bearer token comes from a DuckDB secret
-when one exists, and from an environment variable otherwise:
-
-```sql
-CREATE SECRET (TYPE notion_api, TOKEN 'your-token');      -- per session, never logged
-```
-
-```bash
-NOTION_API_TOKEN=your-token make run-http                # for servers and containers
-```
-
-Try it: the demo API's `/v1/auth` endpoint needs the published token `demo-token`.
-
-```sql
-SELECT count(*) FROM notion.main.fetch_items('https://vgi-starter-api.query-farm.services/v1/auth');   -- fails: HTTP 401
-CREATE SECRET (TYPE notion_api, TOKEN 'demo-token');
-SELECT count(*) FROM notion.main.fetch_items('https://vgi-starter-api.query-farm.services/v1/auth');   -- 25
-```
-
-Never bake credentials into the image or the source. If a function can't run without
-real credentials, its examples can't execute in CI either. Set `execute: false` on the
-metadata check for that worker (see `.github/workflows/ci.yml`), and add
-`LINT_ARGS ?= --no-execute` to the Makefile so local runs match.
+`LOCATION` is the command DuckDB runs, so use an absolute path. Tagged releases ship
+signed standalone executables (no Bun needed); point `LOCATION` at the downloaded binary.
+The same binary serves HTTP with `--http --port 8000` (see the `Dockerfile`).
 
 ## Testing
 
 ```bash
-make test-unit                 # fast TypeScript unit tests
-make test-sql                  # test/sql/*.test through DuckDB (stdio)
+make test-unit                 # bun unit tests (filter translation, property mapping, rendering, rate limiter)
+make test-sql                  # test/sql/notion.test through Haybarn 2.0 (stdio)
 make test-sql TRANSPORT=http   # …over HTTP (also: launch)
+make lint-explain              # vgi-lint, executing examples against the replay server
 make check                     # everything CI runs
 ```
 
-`test/sql/*.test` files are [sqllogictest](https://duckdb.org/docs/stable/dev/sqllogictest/intro)
-scripts. `ci/run-integration.sh` runs them against your worker and fails on any
-unexpected skip, so a broken transport can't hide behind a green run.
-`fetch_items` is tested against `test/mock_api/server.py` so tests are fast and
-offline.
+No test touches the network or a real workspace. `test/mock_api/server.py` is a
+stdlib-only replay server over a hand-built workspace in Notion's documented response
+shapes. It enforces the bearer token and the `Notion-Version` header, rejects unknown
+query parameters and body keys, **evaluates the filter objects it receives** against its
+rows (so a wrong pushdown returns wrong rows or a 400), applies sorts and
+`filter_properties`, pages with small caps and request-bound cursors, completes a
+truncated relation through the property item endpoint, and answers a 429 and a 503 once
+each so the retry paths always run. The SQL tests read its `/__requests` log to check
+exactly what was pushed down and that the token bucket spaced the requests.
 
-**Testing against real data:** put live tests in their own `.test` file that starts with
-`require-env NOTION_LIVE`. They run only when that variable is set. Add the skip reason
-to `EXPECTED_SKIP_REASONS` in CI.
+## Authorship & License
 
-## Metadata and the quality score
+Written by [Query.Farm](https://query.farm). Released under the
+[BSD Zero Clause License](LICENSE) (0BSD).
 
-DuckDB, agents and documentation tools discover your functions through their metadata:
-titles, descriptions, argument docs, examples and keywords.
-[vgi-lint](https://github.com/Query-farm/vgi-lint-check) checks it, and CI runs it on
-every push. Its settings live in `vgi-lint.toml`, which `make lint-explain`,
-`vgi-lint lint`, and CI all read. This template scores 100/100 with no findings.
-
-```bash
-make lint-explain                              # findings, each with its fix
-make lint-explain LINT_ARGS="--format agent"   # the same, grouped for coding agents
-make lint-ai                                   # optional: an agent must solve vgi-agent-tests.yaml
-```
-
-Each report also states an **assurance level**: how much was actually verified.
-
-| Level | Reached when | Here |
-|---|---|---|
-| L1 structural | the static metadata is clean | workers that need real credentials (`execute: false` in CI) |
-| L2 behavioural | the examples also run and return what they claim | **the CI gate** |
-| L3 semantic | an agent solves the worker's own test tasks, and the docs are reviewed | `make lint-ai`, before publishing |
-
-- **How strict.** Your copy fails on warnings (`fail_on = "warning"` in `vgi-lint.toml`).
-  Raise it to `"info"` before you publish the worker for others.
-- **The linter isn't pinned.** It tracks the current quality bar, so a new rule can flag
-  metadata that passed yesterday. Fix it, or waive the finding.
-- **Waivers.** If a finding is genuinely wrong for your worker, waive it in
-  `vgi-lint.toml` with a `kind` and a `reason`.
-- **Existing workers.** If you're adding this gate to a worker that already has
-  findings, record them with `vgi-lint lint --baseline vgi-lint-baseline --update-baseline`
-  and set `baseline` in `vgi-lint.toml`. After that, only new findings fail.
-
-Metadata lives in `src/meta.ts` and the `tags`/`examples` of each function.
-
-## Logging and debugging
-
-stdout carries the Arrow protocol, so **never print to stdout**. Log to stderr instead.
-Use `log` from `src/log.ts` (it writes to stderr); `--debug` or `--log-level debug` turns it up and also enables the SDK's own tracing (`VGI_DEBUG`).
-
-- Under DuckDB (stdio/launch), worker stderr shows up in DuckDB's error messages and
-  terminal.
-- In Docker it goes to `docker logs`.
-- `make debug` runs one query against the worker with debug logging on.
-
-## Deploying
-
-The same binary serves stdio (DuckDB starts it locally) or HTTP (you host it):
-
-```bash
-docker build -t weather-worker .
-docker run -p 8000:8000 -e NOTION_API_TOKEN=... weather-worker   # health: GET /health
-```
-
-```sql
-ATTACH 'notion' (TYPE vgi, LOCATION 'https://workers.example.com/notion');
-```
-
-Put hosted workers behind TLS and authentication. See
-[authentication](https://query.farm/vgi/authentication) for bearer tokens and JWTs, and
-[distributing a worker](https://query.farm/vgi/distributing-a-worker) for packaging.
-Pass secrets with `-e` or your platform's secret manager.
-
-## Releasing
-
-Push a tag like `v0.1.0`. The release workflow compiles the worker with `bun build --compile` into a standalone executable for Linux (x86-64, arm64), macOS (arm64) and Windows (x86-64), and attaches the archives to the GitHub release. Users download one file and point `LOCATION` at it, with no Bun or `node_modules` on the host. Every artifact is signed with cosign and
-carries SLSA build provenance. `ci/check-version.sh` makes sure the tag matches the
-version in `package.json`.
-
-## Using with coding agents
-
-[AGENTS.md](AGENTS.md) is written for AI coding agents (Claude Code reads it via
-`CLAUDE.md`; Codex, Cursor and others read it directly). It covers the commands, the
-recipe for adding a function, the metadata checklist and the sharp edges. A good first
-prompt:
-
-> Read AGENTS.md. Replace `fetch_items` with `forecast(lat DOUBLE, lon DOUBLE)` that calls
-> the Open-Meteo API. Include full metadata, a mock-server test and a `NOTION_LIVE` test.
-> You're done when `make check` passes.
-
-## Keeping up with the template
-
-`make template-diff` shows what changed upstream (CI, docs, examples) since your copy was
-made. Your copy records its template version in `.vgi-notion.json`.
-
-## Learn more
-
-- [What is VGI?](https://query.farm/vgi) · [Getting started](https://query.farm/vgi/getting-started) · [Building a worker](https://query.farm/vgi/building-a-worker)
-- [TypeScript SDK docs](https://query.farm/vgi/docs/typescript/): [scalar tutorial](https://query.farm/vgi/docs/typescript/tutorial/scalar/), [table tutorial](https://query.farm/vgi/docs/typescript/tutorial/table/)
-- [Distributing a worker](https://query.farm/vgi/distributing-a-worker) · [Choosing a language](https://query.farm/vgi/languages) · [llms.txt](https://query.farm/vgi/llms.txt)
-- SDK source: [@query-farm/vgi](https://github.com/Query-farm/vgi-typescript) · RPC layer: [https://vgi-rpc-typescript.query.farm](https://vgi-rpc-typescript.query.farm)
-
-## Support
-
-Open an issue on this repository. For VGI itself, see [query.farm](https://query.farm).
-
-## Authorship & license
-
-The starter template is written by [Query.Farm](https://query.farm) and released under
-the [BSD Zero Clause License](LICENSE) (0BSD). Use it for anything, with no attribution
-required. Replace this section with your own license once the code is yours.
+Copyright 2026 Query Farm LLC - https://query.farm

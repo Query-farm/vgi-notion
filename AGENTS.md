@@ -25,25 +25,30 @@ src/
   worker.ts        # entry point: serves the catalog over stdio, --unix or --http
   catalog.ts       # assembles the catalog; add new functions to FUNCTIONS
   meta.ts          # catalog/schema metadata + helpers (objectTags, column)
-  greet.ts         # scalar example (overloads, const param with choices)
-  sequence.ts      # table function example (named args, streaming state)
-  fetch_items.ts   # REST API table function (pagination, retries, secrets)
+  notion/client.ts     # notion secret -> bearer auth, Notion-Version pin, token bucket, 429 Retry-After, retries
+  notion/table.ts      # generic table function / catalog table factory (columns, paged state, pushdown)
+  notion/properties.ts # Notion property types -> typed columns + value extraction
+  notion/filter.ts     # SQL filters -> Notion filter object (narrowing only, depth <= 2)
+  notion/datasource.ts # data source / database id resolution, formula result-type sampling
+  notion/query.ts      # query_data_source / query_database (schema at bind, filter_properties)
+  notion/blocks.ts     # blocks (externalized DFS stack), page_markdown, page_text
+  notion/render.ts     # block tree -> Markdown / plain text
+  notion/resources.ts  # search, data_sources, databases, users, page, page_properties, comments, data_source_schema
   cli.ts           # flag parsing: stdio / --unix / --http (PORT:<n>, /health)
   log.ts           # stderr logger
-bin/               # vgi-notion-worker (what DuckDB launches) and run-recipe
+bin/               # vgi-notion-worker (what DuckDB launches)
 tests/             # bun unit tests (worker subprocess + mock API)
 test/sql/          # sqllogictest files run through DuckDB
-test/mock_api/     # offline mock of the REST API used by tests
-examples/          # recipes: pushdown, caching, catalog tables, aggregates, COPY …
-ci/                # integration harness used by `make test-sql` and CI
+test/mock_api/     # strict Notion replay server (filter evaluator, auth + version, paging, 429s, request log)
+ci/                # integration harness (`make test-sql`) and lint-with-fixtures.sh (`make lint-explain`)
 scripts/           # vgi_template.py (init / template-diff)
 vgi-agent-tests.yaml  # private graders for the agent test tasks
 ```
 
 ## Recipe: add a function
 
-1. Create `src/<name>.ts`. Copy the closest example: `greet.ts` for a scalar,
-   `sequence.ts` for a generator, `fetch_items.ts` for an API.
+1. For a new Notion endpoint add a `defineNotionTable` spec (or `defineCatalogTable` for a
+   no-argument listing) to `src/notion/resources.ts`, with fixtures in `test/mock_api/`.
 2. Declare arguments: `params` + `argDocs` (scalars), or the ordered `parameters`
    list when a constant needs `choices`/`ge`/`le`. Table functions use `args`,
    `argDocs` and `argConstraints`; an argument listed in `argDefaults` becomes a
@@ -102,7 +107,7 @@ reviewed. It's optional, so run it before publishing.
 | write data out to a file or service | `COPY … TO` copy function |
 | accept INSERT / UPDATE / DELETE | writable catalog table: `TableDescriptor.insertFunction` / `updateFunction` / `deleteFunction` |
 
-Recipes for most kinds are in `examples/`. Writable tables have no recipe:
+Recipes for most kinds are in the starter's `examples/` (removed here). Writable tables have no recipe:
 
 A writable table is a `TableDescriptor` that names a table in-out function per operation in
 `insertFunction`, `updateFunction` and `deleteFunction`, with the richest result each one
@@ -135,8 +140,8 @@ and `examples/writable-tx-worker.ts` in vgi-typescript are complete workers.
 - **State must be serializable.** Table-function state (`initialState`/`process`) must be a plain object of numbers, bigints, strings, booleans, arrays or nested plain objects (no `Date`, `Map` or class instances): the SDK infers an Arrow schema for it and serializes it. Over HTTP each batch can be served by a different process, so the cursor travels with the request. Keep it small, and never put secrets in it.
 - **Examples must be deterministic.** Add `ORDER BY`, and no `now()`, random values or
   network. Examples that hit a live API go in `examples`, not `executable_examples`.
-- **Credentials.** Read them from a DuckDB secret first (`CREATE SECRET (TYPE notion_api, …)`),
-  then from an environment variable. Never put them in logs, examples or the repo, and
+- **Credentials.** Read them from the DuckDB secret (`CREATE SECRET (TYPE notion, …)`) only;
+  this worker never reads environment variables. Never put them in logs, examples or the repo, and
   keep them out of table-function state unless the state rule above says
   the SDK encrypts it. Workers that need real credentials set `execute: false` on the metadata check.
 - **Errors.** Raise errors with a clear message. For HTTP failures, include the status
@@ -175,7 +180,7 @@ and `examples/writable-tx-worker.ts` in vgi-typescript are complete workers.
 ## Useful prompts
 
 - "Add a scalar `slugify(text VARCHAR) -> VARCHAR` with full metadata and tests."
-- "Replace `fetch_items` with a table function for <API>. Map its JSON to typed columns,
-  read the token from a `notion_api` secret, and add mock-server tests."
+- "Add a `page_property_items` function for /v1/pages/{id}/properties/{property_id} with fixtures in the
+  replay server and SQL tests."
 - "Add a catalog table `countries` (code, name) with a primary key, following
   `examples/catalog_tables`."
