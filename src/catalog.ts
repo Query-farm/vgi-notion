@@ -3,7 +3,7 @@
  */
 
 import { type CatalogDescriptor, field, schema, utf8, type VgiFunction } from "@query-farm/vgi";
-import { CATALOG_COMMENT, CATALOG_NAME, CATALOG_TAGS, SCHEMA_DOC_MD, SCHEMA_TAGS, SOURCE_URL } from "./meta.ts";
+import { CATALOG_COMMENT, CATALOG_NAME, CATALOG_TAGS, SCHEMA_COMMENT, SCHEMA_TAGS, SOURCE_URL } from "./meta.ts";
 import { blocks, pageMarkdown, pageText } from "./notion/blocks.ts";
 import { DEFAULT_BASE_URL, DEFAULT_RPS, NOTION_VERSION, SECRET_TYPE } from "./notion/client.ts";
 import { queryDatabase, queryDataSource } from "./notion/query.ts";
@@ -95,7 +95,7 @@ export const CATALOG: CatalogDescriptor = {
   schemas: [
     {
       path: ["main"],
-      comment: SCHEMA_DOC_MD,
+      comment: SCHEMA_COMMENT,
       functions: FUNCTIONS,
       tables: NOTION_TABLES,
       tags: { ...SCHEMA_TAGS, "vgi.example_queries": JSON.stringify(ALL_EXAMPLES) },

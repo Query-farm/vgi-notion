@@ -106,11 +106,18 @@ export const SCHEMA_DOC_LLM =
   "or notion.so URLs. people / relation columns hold ids: join them to the users table or to another " +
   "data source's id.";
 
+export const SCHEMA_COMMENT =
+  "Read-only SQL over the Notion pages, databases, content, comments and people an integration can see.";
+
 export const SCHEMA_DOC_MD =
   "## main\n\n" +
-  "Search, databases and data sources (schemas and typed row queries with filter pushdown), page " +
-  "metadata and properties, block trees, Markdown and plain-text rendering, comments and users.\n\n" +
-  "All objects need a `notion` secret.";
+  "A read-only view of a Notion workspace, scoped to what the integration behind the `notion` secret has been " +
+  "shared with. Discover pages and data sources by title, then query a data source as a typed table whose " +
+  "columns are its properties; `WHERE` predicates on those columns are pushed into Notion's own filter, so only " +
+  "matching rows come back.\n\n" +
+  "Page content is available as structured blocks or rendered Markdown and plain text, alongside metadata, " +
+  "properties and comments. Ids accept dashed UUIDs, 32 hex digits or notion.so URLs, and people and relation " +
+  "columns hold ids you can join back to users or to another data source.";
 
 /** Fixture ids used in examples and agent tasks (the replay server in test/mock_api serves them). */
 export const TASKS_DS = "1a2b3c4d-0000-4000-8000-00000000d501";
