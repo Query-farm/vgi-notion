@@ -205,7 +205,9 @@ export function renderBlocks(nodes: BlockNode[], fmt: Format, sep = "\n\n"): str
     number = t === "numbered_list_item" ? (prevType === "numbered_list_item" ? number + 1 : 1) : 0;
     const chunk = renderBlock(n, fmt, number);
     if (chunk !== "") {
-      const tight = LIST_TYPES.has(t) && LIST_TYPES.has(prevType);
+      // Items of one list are joined tightly; bullets, to-dos and toggles share the "-" marker.
+      const family = (x: string) => (x === "numbered_list_item" ? "ol" : LIST_TYPES.has(x) ? "ul" : "");
+      const tight = family(t) !== "" && family(t) === family(prevType);
       parts.push(parts.length === 0 ? chunk : (tight ? "\n" : sep) + chunk);
     }
     prevType = t;
