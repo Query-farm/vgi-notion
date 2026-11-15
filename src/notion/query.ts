@@ -16,7 +16,16 @@
  *   page property item endpoint.
  */
 
-import { bool, defineTableFunction, field, formatPushedFilters, schema, utf8, type VgiFunction, type VgiSchema } from "@query-farm/vgi";
+import {
+  bool,
+  defineTableFunction,
+  field,
+  formatPushedFilters,
+  schema,
+  utf8,
+  type VgiFunction,
+  type VgiSchema,
+} from "@query-farm/vgi";
 import { log } from "../log.ts";
 import { column } from "../meta.ts";
 import {
@@ -227,7 +236,9 @@ function makeQueryFunction(opts: {
       const user = parseJsonArg(params.args.notion_filter, "notion_filter", "object") as Json | undefined;
       const sorts = parseJsonArg(params.args.notion_sorts, "notion_sorts", "array") as Json[] | undefined;
       const filter = combineFilters(user, pushed);
-      log.debug(`${opts.name}: pushed ${formatPushedFilters(params.pushdownFilters)} → ${JSON.stringify(filter ?? null)}`);
+      log.debug(
+        `${opts.name}: pushed ${formatPushedFilters(params.pushdownFilters)} → ${JSON.stringify(filter ?? null)}`,
+      );
 
       const byName = new Map(props.map((p) => [p.name, p]));
       const getters = new Map<string, (r: Json) => unknown>([

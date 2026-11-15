@@ -25,7 +25,7 @@ export function plainOrNull(rt: unknown): string | null {
 
 /** Escape Markdown punctuation that would otherwise change meaning. */
 export function escapeMd(s: string): string {
-  return s.replace(/([\\`*_[\]<>|~])/g, "\\$1");
+  return s.replace(/([\\`*_[\]<>~])/g, "\\$1");
 }
 
 /** Wrap text in a mark, keeping surrounding whitespace outside it (`** a **` is not bold). */
