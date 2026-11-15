@@ -76,22 +76,17 @@ export const CATALOG_COMMENT =
 
 export const CATALOG_DOC_LLM =
   "Read-only SQL access to a Notion workspace through the Notion API (Notion-Version 2026-03-11, the " +
-  "data-source era: a database is a container of one or more data sources, and rows are pages of a data " +
-  "source). Start with search(query := '…') or the data_sources / databases tables to find ids (ids may " +
-  "be pasted as notion.so URLs). data_source_schema(id) lists each property and the SQL column it " +
-  "becomes; query_data_source(id) (or query_database(database_id) for a single-source database) returns " +
-  'the rows with one typed column per property, named verbatim (quote them: "Status"): title/rich_text ' +
-  'VARCHAR plain text plus a "<name>__json" raw rich text column, number DOUBLE, checkbox BOOLEAN, ' +
-  "select/status VARCHAR, multi_select VARCHAR[], people/relation VARCHAR[] of ids, date STRUCT(start, " +
-  "end TIMESTAMPTZ, time_zone, has_time), files LIST(STRUCT), unique_id BIGINT, formula/rollup typed by " +
-  "result. WHERE on properties and created_time/last_edited_time pushes into Notion's filter object; " +
-  "projection pushes into filter_properties. Page content: blocks(id) gives the block tree as rows " +
-  "(type, text, depth, path for document order), page_markdown(id) / page_text(id) render a page to one " +
-  "Markdown or plain-text document (for export, search and RAG). page(id) and page_properties(id) give " +
-  "one page's metadata and its properties in long form; comments(id) the open comments; users the " +
-  "people and bots. Every object needs a `notion` secret: CREATE SECRET (TYPE notion, TOKEN 'ntn_…') " +
-  "with an internal integration secret (or OAUTH_ACCESS_TOKEN), and the pages/databases must be shared " +
-  "with that integration. Requests are rate-limited client-side to ~3/s and 429 Retry-After is honoured. " +
+  "data-source era). Key concepts: a database is a container holding one or more data sources; the rows of " +
+  "a data source are pages whose properties (title, status, select, people, relation, date, formula, " +
+  "rollup, …) become typed columns named exactly as in Notion; a page's body is a tree of blocks that can " +
+  "be read as rows or rendered to Markdown / plain text. Typical flow: find an id by title search or by " +
+  "listing data sources, inspect the data source's property schema, then query its rows with ordinary SQL — " +
+  "WHERE on properties and on created / last edited time is translated into Notion's filter object, and " +
+  "only the selected properties are downloaded. Ids may be pasted as notion.so URLs. Reach for it to report " +
+  "on Notion task boards and CRMs, join Notion data with other sources, or export page content for search " +
+  "and RAG. Everything needs a `notion` secret: CREATE SECRET (TYPE notion, TOKEN 'ntn_…') with an internal " +
+  "integration secret (or OAUTH_ACCESS_TOKEN), and the pages and databases must be shared with that " +
+  "integration. Requests are rate-limited client-side to about 3 per second and 429 Retry-After is honoured. " +
   "Docs: https://developers.notion.com/reference/intro .";
 
 export const CATALOG_DOC_MD =
@@ -104,12 +99,12 @@ export const CATALOG_DOC_MD =
   SOURCES_MD;
 
 export const SCHEMA_DOC_LLM =
-  "Notion as SQL. Discovery: search(query := '') over pages and data sources (WHERE object = 'page' | " +
-  "'data_source' pushes down); tables data_sources and databases (WHERE id = … reads one directly) and " +
-  "users. Rows: data_source_schema(id) then query_data_source(id, notion_filter := NULL, notion_sorts := " +
-  "NULL, rich_text_json := true) or query_database(database_id). Content: page(id), page_properties(id), " +
-  "blocks(id, max_depth := 10, include_child_pages := false), page_markdown(id), page_text(id), " +
-  "comments(id). Ids accept dashed UUIDs, 32 hex digits or notion.so URLs.";
+  "Notion as SQL. Discovery objects list what the integration can see (pages and data sources by title, " +
+  "databases, people); typed row queries turn one data source into a table whose columns are its " +
+  "properties, with WHERE pushed into Notion's filter; content objects read one page's metadata, " +
+  "properties, block tree, rendered Markdown / text and comments. Ids accept dashed UUIDs, 32 hex digits " +
+  "or notion.so URLs. people / relation columns hold ids: join them to the users table or to another " +
+  "data source's id.";
 
 export const SCHEMA_DOC_MD =
   "## main\n\n" +
@@ -134,10 +129,43 @@ export const AGENT_TEST_TASKS = [
   { name: "roadmap_comments", prompt: "Who commented on the Product Roadmap page, and what did they say?" },
   { name: "people", prompt: "List the people (not bots) in the Notion workspace." },
   { name: "ada_tasks", prompt: "Which Notion tasks is Ada Lovelace assigned to?" },
+  {
+    name: "database_sources",
+    prompt: "Which Notion database holds more than one data source, and what are they called?",
+  },
+  {
+    name: "done_via_database_url",
+    prompt:
+      "How many tasks are Done in the database at https://www.notion.so/acme/Tasks-1a2b3c4d00004000800000000000d001 ?",
+  },
+  {
+    name: "task_parent",
+    prompt: "Which data source is the Notion page 1a2b3c4d-0000-4000-8000-00000000c001 a row of?",
+  },
+  {
+    name: "task_properties",
+    prompt:
+      "List the non-empty properties of the Notion page 'Search UI' (id 1a2b3c4d-0000-4000-8000-00000000c004) with their values.",
+  },
+  { name: "roadmap_word_count", prompt: "Roughly how many words of text does the Product Roadmap page contain?" },
+];
+
+/** Guaranteed-runnable probes: they bind each object and show its columns without fetching (LIMIT 0). */
+export const EXECUTABLE_EXAMPLES = [
+  {
+    name: "search_columns",
+    description: "The search() result columns (binds only; create a notion secret and drop LIMIT 0 for rows)",
+    sql: "SELECT object, id, title, url, last_edited_time FROM notion.main.search() LIMIT 0",
+  },
+  {
+    name: "users_columns",
+    description: "The users table's columns (binds only; create a notion secret and drop LIMIT 0 for rows)",
+    sql: "SELECT id, type, name, email FROM notion.main.users LIMIT 0",
+  },
 ];
 
 export const CATALOG_TAGS: Record<string, string> = {
-  "vgi.title": "Notion",
+  "vgi.title": "Notion Workspace as SQL",
   "vgi.subtitle": "Notion databases, pages and blocks as typed SQL tables, with filter pushdown and Markdown export.",
   "vgi.doc_llm": CATALOG_DOC_LLM,
   "vgi.doc_md": CATALOG_DOC_MD,
@@ -153,6 +181,7 @@ export const CATALOG_TAGS: Record<string, string> = {
   "vgi.support_policy_url": `${SOURCE_URL}#support`,
   // Public analyst tasks for `vgi-lint simulate`; private graders live in vgi-agent-tests.yaml.
   "vgi.agent_test_tasks": JSON.stringify(AGENT_TEST_TASKS),
+  "vgi.executable_examples": JSON.stringify(EXECUTABLE_EXAMPLES),
 };
 
 export const SCHEMA_TAGS: Record<string, string> = {

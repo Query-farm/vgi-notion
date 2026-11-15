@@ -189,6 +189,8 @@ export interface TableSpec<A, S> {
   examples: FnExample[];
   /** Column attested NOT NULL + PRIMARY KEY when exposed as a catalog table. */
   primaryKey?: string;
+  /** Catalog tables: columns that always reference another table's primary key (`id`). */
+  foreignKeys?: { column: string; table: string }[];
 }
 
 export function tagsOf(spec: {
@@ -200,6 +202,8 @@ export function tagsOf(spec: {
   pushdown?: string;
   columns?: Col[];
   resultColumns?: { name: string; type: string; description: string }[];
+  /** For a schema computed at bind (query_data_source): Markdown instead of a fixed column list. */
+  dynamicColumnsMd?: string;
 }): Record<string, string> {
   return {
     domain: "knowledge management",
@@ -210,9 +214,14 @@ export function tagsOf(spec: {
       docLlm: spec.docLlm,
       docMd: spec.docMd + (spec.pushdown ? `\n\n**Pushdown:** ${spec.pushdown}` : ""),
     }),
-    "vgi.result_columns_schema": JSON.stringify(
-      spec.resultColumns ?? (spec.columns ?? []).map((c) => ({ name: c.name, type: c.sqlType, description: c.doc })),
-    ),
+    ...(spec.dynamicColumnsMd
+      ? { "vgi.result_dynamic_columns_md": spec.dynamicColumnsMd }
+      : {
+          "vgi.result_columns_schema": JSON.stringify(
+            spec.resultColumns ??
+              (spec.columns ?? []).map((c) => ({ name: c.name, type: c.sqlType, description: c.doc })),
+          ),
+        }),
   };
 }
 
@@ -290,7 +299,21 @@ export function defineCatalogTable<S extends ScanStateBase>(
     comment: spec.description,
     columns: schemaOf(spec.columns),
     function: fn,
-    constraints: pk ? [record(`${pk}_not_null`, "NOT_NULL"), record("pk", "PRIMARY_KEY")] : [],
+    constraints: [
+      ...(pk ? [record(`${pk}_not_null`, "NOT_NULL"), record("pk", "PRIMARY_KEY")] : []),
+      ...(spec.foreignKeys ?? []).map((fk) =>
+        constraintRecord({
+          schemaPath: [schemaName],
+          table: spec.name,
+          id: `${fk.column}_fk`,
+          kind: "FOREIGN_KEY",
+          columns: [[fk.column]],
+          enforcement: "ENFORCED",
+          validation: "ALL_ROWS",
+          references: { schemaPath: [schemaName], table: fk.table, columns: [["id"]], constraintId: "pk" },
+        }),
+      ),
+    ],
     tags: { ...tagsOf(spec), "vgi.example_queries": JSON.stringify(spec.examples) },
   };
 }

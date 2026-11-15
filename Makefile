@@ -44,7 +44,7 @@ test-sql-all: ## SQL tests over every transport
 test: test-unit test-sql ## Unit + SQL tests
 
 lint-explain: build ## Metadata quality report (vgi-lint, settings in vgi-lint.toml). LINT_ARGS="--format agent" for agents
-	$(VGI_LINT) "$(WORKER)" $(LINT_ARGS)
+	PYTHON="uv run --no-project python" ci/lint-with-fixtures.sh $(VGI_LINT) "$(WORKER)" $(LINT_ARGS)
 
 lint-ai: ## Opt-in L3 check: an agent runs vgi-agent-tests.yaml and docs are reviewed (needs the claude CLI)
 	@$(MAKE) --no-print-directory lint-explain LINT_ARGS="--ai $(LINT_ARGS)"

@@ -170,7 +170,7 @@ export const DATA_SOURCES = defineCatalogTable<FanoutState>(
   {
     name: "data_sources",
     description: "Every Notion data source (the row collections inside databases) shared with the integration",
-    title: "Data Sources",
+    title: "Notion Data Sources",
     category: "databases",
     keywords: "notion, data sources, databases, tables, schema, list, catalog",
     docLlm:
@@ -184,6 +184,7 @@ export const DATA_SOURCES = defineCatalogTable<FanoutState>(
       "query the rows of one with `query_data_source(id)`.",
     columns: DATA_SOURCE_COLUMNS,
     primaryKey: "id",
+    foreignKeys: [{ column: "database_id", table: "databases" }],
     initialState: fanoutInit,
     next: async (scan, state) => {
       const ids = idsFrom(eqValues(scan.filters, "id"));
@@ -235,7 +236,7 @@ export const DATABASES = defineCatalogTable<FanoutState>(
   {
     name: "databases",
     description: "Notion databases (containers of one or more data sources) shared with the integration",
-    title: "Databases",
+    title: "Notion Databases",
     category: "databases",
     keywords: "notion, databases, containers, data sources, inline, list, catalog",
     docLlm:
@@ -312,7 +313,7 @@ export const USERS = defineCatalogTable<FanoutState>(
   {
     name: "users",
     description: "People and bots in the Notion workspace",
-    title: "Users",
+    title: "Workspace Users",
     category: "workspace",
     keywords: "notion, users, people, members, guests, bots, integrations, workspace",
     docLlm:

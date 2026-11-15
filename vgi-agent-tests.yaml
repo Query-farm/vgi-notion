@@ -1,16 +1,75 @@
 # Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
-# `vgi-lint lint --ai` runs an agent on each prompt and grades it with check_sql.
-# See https://github.com/Query-farm/vgi-lint-check (VGI920).
+# `vgi-lint lint --ai` runs an agent on each prompt and grades it (VGI920).
+#
+# Every notion object needs a `notion` secret. The offline replay server in
+# test/mock_api/server.py works: CREATE SECRET (TYPE notion, TOKEN 'ntn_test_token',
+# BASE_URL 'http://127.0.0.1:<port>', REQUESTS_PER_SECOND '50'). The fixture workspace is
+# static, so the tasks compare against reference queries.
 tasks:
-  - name: formal_greeting
-    reference_sql: SELECT notion.main.greet('Grace', 'formal') AS greeting
-  - name: sum_of_squares
-    reference_sql: SELECT sum(squared) AS total FROM notion.main.sequence_table(10)
-  - name: stepped_sequence
-    reference_sql: SELECT n FROM notion.main.sequence_table(4, step := 5) ORDER BY n
-  # Reads the public demo API (https://vgi-starter-api.query-farm.services/v1).
-  - name: items_per_category
+  - name: find_roadmap
+    reference_sql: >-
+      SELECT url FROM notion.main.search(query := 'Product Roadmap') WHERE object = 'page' AND title = 'Product Roadmap'
+  - name: list_data_sources
+    reference_sql: >-
+      SELECT title FROM notion.main.data_sources ORDER BY title
+  - name: open_tasks
+    reference_sql: >-
+      SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501')
+      WHERE "Status" <> 'Done' ORDER BY "Name"
+  - name: tasks_per_status
+    reference_sql: >-
+      SELECT "Status", count(*) AS tasks FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501')
+      GROUP BY "Status" ORDER BY "Status"
+  - name: search_tagged
+    reference_sql: >-
+      SELECT "Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501')
+      WHERE list_contains("Tags", 'search') ORDER BY "Name"
+  - name: estimate_total
+    reference_sql: >-
+      SELECT sum("Estimate") FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501')
+      WHERE "Status" = 'In progress'
+  - name: status_options
+    reference_sql: >-
+      SELECT unnest(options).name AS status FROM notion.main.data_source_schema('1a2b3c4d-0000-4000-8000-00000000d501')
+      WHERE property = 'Status' ORDER BY status
+  - name: roadmap_headings
+    reference_sql: >-
+      SELECT text FROM notion.main.blocks('1a2b3c4d-0000-4000-8000-00000000a001')
+      WHERE type LIKE 'heading_%' ORDER BY path
+  - name: roadmap_todos
+    reference_sql: >-
+      SELECT count(*) FROM notion.main.blocks('1a2b3c4d-0000-4000-8000-00000000a001') WHERE type = 'to_do' AND checked
+  - name: roadmap_markdown
     check_sql: >-
-      SELECT count(*) = 3 AND sum(items) = 25
-      FROM (SELECT category, count(*) AS items
-            FROM notion.main.fetch_items('https://vgi-starter-api.query-farm.services/v1') GROUP BY category)
+      SELECT count(*) = 1 AND bool_and(markdown LIKE '# Product Roadmap%' AND markdown LIKE '%- [x] Write spec%')
+      FROM notion.main.page_markdown('1a2b3c4d-0000-4000-8000-00000000a001')
+  - name: roadmap_comments
+    reference_sql: >-
+      SELECT display_name, text FROM notion.main.comments('1a2b3c4d-0000-4000-8000-00000000a001') ORDER BY created_time
+  - name: people
+    reference_sql: >-
+      SELECT name FROM notion.main.users WHERE type = 'person' ORDER BY name
+  - name: ada_tasks
+    reference_sql: >-
+      SELECT t."Name" FROM notion.main.query_data_source('1a2b3c4d-0000-4000-8000-00000000d501') t, notion.main.users u
+      WHERE list_contains(t."Assignee", u.id) AND u.name = 'Ada Lovelace' ORDER BY t."Name"
+  - name: database_sources
+    reference_sql: >-
+      SELECT title, unnest(data_sources).name AS data_source FROM notion.main.databases
+      WHERE len(data_source_ids) > 1 ORDER BY data_source
+  - name: done_via_database_url
+    reference_sql: >-
+      SELECT count(*) FROM notion.main.query_database('https://www.notion.so/acme/Tasks-1a2b3c4d00004000800000000000d001')
+      WHERE "Status" = 'Done'
+  - name: task_parent
+    reference_sql: >-
+      SELECT ds.title FROM notion.main.page('1a2b3c4d-0000-4000-8000-00000000c001') p
+      JOIN notion.main.data_sources ds ON ds.id = p.data_source_id
+  - name: task_properties
+    reference_sql: >-
+      SELECT property, text FROM notion.main.page_properties('1a2b3c4d-0000-4000-8000-00000000c004')
+      WHERE text IS NOT NULL ORDER BY position
+  - name: roadmap_word_count
+    check_sql: >-
+      SELECT count(*) = 1 AND bool_and(len(regexp_split_to_array(trim(text), '\s+')) BETWEEN 40 AND 120)
+      FROM notion.main.page_text('1a2b3c4d-0000-4000-8000-00000000a001')

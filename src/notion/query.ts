@@ -204,11 +204,11 @@ function makeQueryFunction(opts: {
           ? "Data source id or URL (a database id also works when the database has one data source)."
           : "Database id or notion.so URL; the database must hold exactly one data source.",
       notion_filter:
-        "Optional Notion filter object as JSON (ANDed with the WHERE clause), e.g. " +
-        '\'{"property":"Status","status":{"equals":"Done"}}\'.',
+        "Optional Notion filter object as JSON text, ANDed with what the WHERE clause pushes down " +
+        "(https://developers.notion.com/reference/filter-data-source-entries).",
       notion_sorts:
-        'Optional Notion sorts array as JSON, e.g. \'[{"property":"Due","direction":"descending"}]\' ' +
-        "(Notion orders the rows; add ORDER BY in SQL to guarantee an order).",
+        "Optional Notion sorts array as JSON text (https://developers.notion.com/reference/sort-data-source-entries); " +
+        "Notion orders the rows, so add ORDER BY in SQL to guarantee an order.",
       rich_text_json: "Add a `<property>__json` JSON column with the raw rich text of each title / rich_text property.",
     },
     filterPushdown: true,
@@ -293,29 +293,83 @@ function makeQueryFunction(opts: {
       keywords: opts.keywords,
       docLlm: opts.docLlm,
       docMd: opts.docMd,
-      resultColumns: [
-        { name: "id", type: "VARCHAR", description: "Page id of the row." },
-        {
-          name: "<property>",
-          type: "per property type",
-          description:
-            "One column per data source property, named verbatim (see data_source_schema for each column's name and type).",
-        },
-        ...PAGE_META.map((m) => ({ name: m.name, type: m.sql, description: m.doc })),
-      ],
+      dynamicColumnsMd:
+        "Columns are computed from the data source's schema when the query is bound: `id`, then one column per " +
+        "property named exactly as in Notion (`data_source_schema(id)` lists each column's name and type; a " +
+        "`<name>__json` sibling follows each title / rich_text property, and a name colliding with another " +
+        "column gets a `_2` suffix), then the page metadata columns.\n\n" +
+        "| Name | Type | Description |\n| --- | --- | --- |\n" +
+        "| id | VARCHAR | Page id of the row. |\n" +
+        "| <title / rich_text property> | VARCHAR | Plain text. |\n" +
+        "| <title / rich_text property>__json | JSON | Raw rich text (marks, links, mentions). |\n" +
+        "| <number property> | DOUBLE | The number. |\n" +
+        "| <checkbox property> | BOOLEAN | Ticked or not. |\n" +
+        "| <select / status property> | VARCHAR | Option name. |\n" +
+        "| <multi_select property> | VARCHAR[] | Option names. |\n" +
+        "| <people / relation property> | VARCHAR[] | User ids / related page ids. |\n" +
+        '| <date property> | STRUCT("start" TIMESTAMP WITH TIME ZONE, "end" TIMESTAMP WITH TIME ZONE, time_zone VARCHAR, has_time BOOLEAN) | Date or range; all-day dates at 00:00 UTC. |\n' +
+        "| <created_time / last_edited_time property> | TIMESTAMP WITH TIME ZONE | The instant. |\n" +
+        "| <created_by / last_edited_by property> | VARCHAR | User id. |\n" +
+        "| <url / email / phone_number property> | VARCHAR | The value. |\n" +
+        '| <files property> | STRUCT("name" VARCHAR, "type" VARCHAR, url VARCHAR, expiry_time TIMESTAMP WITH TIME ZONE)[] | Attached files. |\n' +
+        "| <unique_id property> | BIGINT | The number (prefix in data_source_schema). |\n" +
+        "| <formula property, text result> | VARCHAR | Formula result. |\n" +
+        "| <formula property, boolean result> | BOOLEAN | Formula result. |\n" +
+        "| <formula / rollup property, number result> | DOUBLE | Result (rollups: count, sum, average, …). |\n" +
+        "| <rollup property, show_original / show_unique> | VARCHAR[] | The rolled-up values as text. |\n" +
+        '| <formula / rollup property, date result> | STRUCT("start" TIMESTAMP WITH TIME ZONE, "end" TIMESTAMP WITH TIME ZONE, time_zone VARCHAR, has_time BOOLEAN) | Date result. |\n' +
+        "| <other property types> | JSON | Raw value. |\n" +
+        PAGE_META.map((m) => `| ${m.name} | ${m.sql} | ${m.doc} |`).join("\n") +
+        "\n\nExample: the Tasks data source the examples query (`1a2b3c4d-0000-4000-8000-00000000d501`) returns " +
+        "`id`, these property columns, then the metadata columns above.\n\n" +
+        "| Name | Type | Description |\n| --- | --- | --- |\n" +
+        EXAMPLE_COLUMNS.map(([n, t, d]) => `| ${n} | ${t} | ${d} |`).join("\n"),
     }),
     examples: opts.examples,
   });
 }
 
+const DATE_T =
+  'STRUCT("start" TIMESTAMP WITH TIME ZONE, "end" TIMESTAMP WITH TIME ZONE, time_zone VARCHAR, has_time BOOLEAN)';
+
+/** The example Tasks data source's property columns (documents one concrete variant). */
+const EXAMPLE_COLUMNS: [string, string, string][] = [
+  ["Name", "VARCHAR", "title: the task name."],
+  ["Name__json", "JSON", "Raw rich text of Name."],
+  ["Status", "VARCHAR", "status: Not started, In progress or Done."],
+  ["Priority", "VARCHAR", "select: High, Medium or Low."],
+  ["Tags", "VARCHAR[]", "multi_select option names."],
+  ["Assignee", "VARCHAR[]", "people: user ids."],
+  ["Due", DATE_T, "date (or range)."],
+  ["Estimate", "DOUBLE", "number."],
+  ["Blocked", "BOOLEAN", "checkbox."],
+  ["Project", "VARCHAR[]", "relation: page ids in the Projects data source."],
+  ["Notes", "VARCHAR", "rich_text."],
+  ["Notes__json", "JSON", "Raw rich text of Notes."],
+  ["URL_2", "VARCHAR", "url property 'URL' (renamed: it collides with the url column)."],
+  ["Owner email", "VARCHAR", "email."],
+  [
+    "Attachments",
+    'STRUCT("name" VARCHAR, "type" VARCHAR, url VARCHAR, expiry_time TIMESTAMP WITH TIME ZONE)[]',
+    "files.",
+  ],
+  ["Task ID", "BIGINT", "unique_id number (prefix TASK)."],
+  ["Created", "TIMESTAMP WITH TIME ZONE", "created_time."],
+  ["Edited by", "VARCHAR", "last_edited_by user id."],
+  ["Score", "DOUBLE", "formula with a number result."],
+  ["Label", "VARCHAR", "formula with a text result."],
+  ["Project count", "DOUBLE", "rollup count of Project."],
+  ["Project names", "VARCHAR[]", "rollup show_original of the projects' names."],
+];
+
 const QUERY_DOC_LLM =
   "Rows (pages) of a Notion data source as a typed table: one column per property, named exactly as in " +
   'Notion (quote names with spaces or capitals: "Status", "Due date"), plus id, url, created_time, ' +
-  "last_edited_time, created_by, last_edited_by and in_trash. Types: title/rich_text VARCHAR plain text " +
-  '(+ "<name>__json" raw rich text JSON), number DOUBLE, checkbox BOOLEAN, select/status VARCHAR, ' +
-  "multi_select VARCHAR[], people/relation VARCHAR[] of ids (join users / other queries), date " +
-  'STRUCT(start, end TIMESTAMPTZ, time_zone, has_time) — filter with "Due".start, created/last_edited ' +
-  "time TIMESTAMPTZ, files LIST(STRUCT(name,type,url,expiry_time)), unique_id BIGINT, formula/rollup by " +
+  "last_edited_time, created_by, last_edited_by and in_trash. Types: title / rich_text `VARCHAR` plain text " +
+  '(+ "<name>__json" raw rich text `JSON`), number `DOUBLE`, checkbox `BOOLEAN`, select / status `VARCHAR`, ' +
+  "multi_select `VARCHAR[]`, people / relation `VARCHAR[]` of ids (join users or another data source), date " +
+  '`STRUCT("start", "end" TIMESTAMPTZ, time_zone, has_time)` (filter with "Due".start), created / last edited ' +
+  "time `TIMESTAMPTZ`, files `STRUCT(name, type, url, expiry_time)[]`, unique_id `BIGINT`, formula / rollup by " +
   "result type. Call data_source_schema(id) first to see the exact column names and types. WHERE on " +
   "properties pushes down into Notion's filter (equality, ranges, IN, LIKE '%…%' / contains / suffix, list_contains, " +
   "IS NULL, AND/OR); only the columns you select are downloaded. Ids may be given as notion.so URLs.";
