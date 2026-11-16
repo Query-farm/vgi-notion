@@ -161,7 +161,7 @@ truncated result.
 
 ```bash
 git clone https://github.com/Query-farm/vgi-notion.git && cd vgi-notion
-git checkout v0.1.0            # a release tag
+git checkout v0.1.1            # a release tag
 bun install --frozen-lockfile
 ```
 
