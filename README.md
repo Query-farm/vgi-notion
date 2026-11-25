@@ -161,7 +161,7 @@ truncated result.
 
 ```bash
 git clone https://github.com/Query-farm/vgi-notion.git && cd vgi-notion
-git checkout v0.1.1            # a release tag
+git checkout v0.2.0            # a release tag
 bun install --frozen-lockfile
 ```
 
@@ -176,7 +176,7 @@ ATTACH 'notion' (TYPE vgi, LOCATION '/abs/path/to/vgi-notion/bin/vgi-notion-work
 CREATE SECRET notion (TYPE notion, TOKEN 'ntn_…');   -- after ATTACH: the worker registers the type
 ```
 
-**Haybarn 2.0** (`uvx haybarn-cli`):
+**Haybarn 2.0.1+** (`uvx haybarn-cli`; Haybarn 2.0.0 serves an older vgi extension that cannot attach this worker):
 
 ```sql
 INSTALL vgi FROM community;
